@@ -58,7 +58,7 @@ tabular-synth-calibration/
 | `generation.py` | `SyntheticDataGenerator` | Synthetic data generation (CTGAN, TVAE, etc.) |
 | `models.py` | `ModelSelectionFramework` | 44 ML model architectures for evaluation |
 | `metrics.py` | `EvaluationMetrics` | Spearman correlation, rank preservation metrics |
-| `confidence.py` | `ConfidenceIntervalEstimator` | Bootstrap and analytical confidence intervals |
+| `confidence.py` | `ConfidenceIntervalEstimator` | analytical confidence intervals |
 | `theory.py` | `TheoreticalFramework` | Total variation and rank preservation theory |
 | `utils.py` | - | Random seeds and utility functions |
 
