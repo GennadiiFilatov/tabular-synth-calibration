@@ -2,10 +2,6 @@
 
 ---
 
-## Overview
-
-This repository contains the implementation and experimental framework for my master's research work on **calibrated synthetic data validation for machine learning model selection**. The core problem we tackle: **how can we reliably select ML models when we have limited labeled validation data?**
-
 ### The Problem
 
 In tabular data domains (healthcare, finance, science), getting labeled validation data is expensive and time-consuming. Synthetic data could be a solution, but current approaches lack theoretical guarantees and often produce misleading model rankings. This leads to:
