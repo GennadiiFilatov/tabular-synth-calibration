@@ -1,0 +1,13 @@
+{
+  "dataset": "obesity",
+  "method": "tvae",
+  "timestamp": "20260219_041311",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "epochs": 1500,
+    "batch_size": 1024,
+    "embedding_dim": 256,
+    "compress_width": 128,
+    "decompress_width": 512
+  }
+}

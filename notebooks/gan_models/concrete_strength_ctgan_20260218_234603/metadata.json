@@ -1,0 +1,16 @@
+{
+  "dataset": "concrete_strength",
+  "method": "ctgan",
+  "timestamp": "20260218_234603",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 1400,
+    "batch_size": 256,
+    "pac": 1,
+    "generator_lr": 0.00011564046809668843,
+    "discriminator_lr": 0.0003835759673424491,
+    "embedding_dim": 64,
+    "gen_width": 256,
+    "disc_width": 512
+  }
+}

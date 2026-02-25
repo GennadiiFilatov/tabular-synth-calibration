@@ -1,0 +1,13 @@
+{
+  "dataset": "mushroom",
+  "method": "tvae",
+  "timestamp": "20260222_130055",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "epochs": 1000,
+    "batch_size": 64,
+    "embedding_dim": 64,
+    "compress_width": 512,
+    "decompress_width": 256
+  }
+}

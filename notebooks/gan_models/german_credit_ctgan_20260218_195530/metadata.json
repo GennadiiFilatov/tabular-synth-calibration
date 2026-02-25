@@ -1,0 +1,16 @@
+{
+  "dataset": "german_credit",
+  "method": "ctgan",
+  "timestamp": "20260218_195530",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 1200,
+    "batch_size": 512,
+    "pac": 64,
+    "generator_lr": 0.0002138277510675073,
+    "discriminator_lr": 0.00012122516686859985,
+    "embedding_dim": 128,
+    "gen_width": 128,
+    "disc_width": 128
+  }
+}

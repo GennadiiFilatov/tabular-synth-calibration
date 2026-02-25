@@ -1,0 +1,16 @@
+{
+  "dataset": "california_housing",
+  "method": "ctgan",
+  "timestamp": "20260219_183618",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 300,
+    "batch_size": 256,
+    "pac": 32,
+    "generator_lr": 0.0002771597918071769,
+    "discriminator_lr": 0.0004065601542718831,
+    "embedding_dim": 256,
+    "gen_width": 512,
+    "disc_width": 128
+  }
+}

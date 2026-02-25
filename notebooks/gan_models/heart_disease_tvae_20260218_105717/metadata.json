@@ -1,0 +1,15 @@
+{
+  "dataset": "heart_disease",
+  "method": "tvae",
+  "timestamp": "20260218_105717",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "embedding_dim": 64,
+    "compress_dim_1": 512,
+    "compress_dim_2": 192,
+    "decompress_dim_1": 384,
+    "decompress_dim_2": 256,
+    "batch_size": 160,
+    "epochs": 1000
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "dataset": "wine_quality",
+  "method": "tvae",
+  "timestamp": "20260218_195510",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "embedding_dim": 96,
+    "compress_dim_1": 192,
+    "compress_dim_2": 256,
+    "decompress_dim_1": 320,
+    "decompress_dim_2": 320,
+    "batch_size": 128,
+    "epochs": 1000
+  }
+}

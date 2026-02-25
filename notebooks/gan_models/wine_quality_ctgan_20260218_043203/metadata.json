@@ -1,0 +1,16 @@
+{
+  "dataset": "wine_quality",
+  "method": "ctgan",
+  "timestamp": "20260218_043203",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 1100,
+    "batch_size": 128,
+    "pac": 16,
+    "generator_lr": 0.00031462404725940803,
+    "discriminator_lr": 0.0001464974265506749,
+    "embedding_dim": 128,
+    "gen_width": 128,
+    "disc_width": 256
+  }
+}

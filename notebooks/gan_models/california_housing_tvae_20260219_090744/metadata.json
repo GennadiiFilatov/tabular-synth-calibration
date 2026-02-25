@@ -1,0 +1,13 @@
+{
+  "dataset": "california_housing",
+  "method": "tvae",
+  "timestamp": "20260219_090744",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "epochs": 300,
+    "batch_size": 64,
+    "embedding_dim": 256,
+    "compress_width": 256,
+    "decompress_width": 128
+  }
+}

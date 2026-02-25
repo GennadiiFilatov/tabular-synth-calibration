@@ -1,0 +1,15 @@
+{
+  "dataset": "heart_disease",
+  "method": "tabddpm",
+  "timestamp": "20260222_020349",
+  "model_class": "SyntheticDataGenerator",
+  "tune_info": {
+    "training_iterations": 600,
+    "learning_rate": 0.00014254757044027455,
+    "batch_size": 256,
+    "diffusion_timesteps": 500,
+    "dim_hidden": 128,
+    "depth": 1,
+    "dropout": 0.1281323365878769
+  }
+}

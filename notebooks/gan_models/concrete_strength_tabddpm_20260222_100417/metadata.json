@@ -1,0 +1,15 @@
+{
+  "dataset": "concrete_strength",
+  "method": "tabddpm",
+  "timestamp": "20260222_100417",
+  "model_class": "SyntheticDataGenerator",
+  "tune_info": {
+    "training_iterations": 700,
+    "learning_rate": 0.0003823475224675188,
+    "batch_size": 64,
+    "diffusion_timesteps": 50,
+    "dim_hidden": 512,
+    "depth": 4,
+    "dropout": 0.24251920443493832
+  }
+}

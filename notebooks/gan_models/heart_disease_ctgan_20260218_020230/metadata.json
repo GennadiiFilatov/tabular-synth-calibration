@@ -1,0 +1,16 @@
+{
+  "dataset": "heart_disease",
+  "method": "ctgan",
+  "timestamp": "20260218_020230",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 600,
+    "batch_size": 32,
+    "pac": 8,
+    "generator_lr": 0.00013298267121582917,
+    "discriminator_lr": 0.0004543100464805753,
+    "embedding_dim": 64,
+    "gen_width": 256,
+    "disc_width": 128
+  }
+}

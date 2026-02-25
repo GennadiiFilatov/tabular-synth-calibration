@@ -1,0 +1,15 @@
+{
+  "dataset": "german_credit",
+  "method": "tvae",
+  "timestamp": "20260218_043839",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "embedding_dim": 128,
+    "compress_dim_1": 192,
+    "compress_dim_2": 320,
+    "decompress_dim_1": 128,
+    "decompress_dim_2": 448,
+    "batch_size": 64,
+    "epochs": 1500
+  }
+}

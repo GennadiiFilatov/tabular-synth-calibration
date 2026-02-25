@@ -1,0 +1,16 @@
+{
+  "dataset": "diabetes",
+  "method": "ctgan",
+  "timestamp": "20260218_035310",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 700,
+    "batch_size": 32,
+    "pac": 16,
+    "generator_lr": 0.00013399549522183018,
+    "discriminator_lr": 0.00013433656868034314,
+    "embedding_dim": 128,
+    "gen_width": 256,
+    "disc_width": 512
+  }
+}

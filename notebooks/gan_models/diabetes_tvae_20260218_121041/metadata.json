@@ -1,0 +1,15 @@
+{
+  "dataset": "diabetes",
+  "method": "tvae",
+  "timestamp": "20260218_121041",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "embedding_dim": 224,
+    "compress_dim_1": 256,
+    "compress_dim_2": 128,
+    "decompress_dim_1": 384,
+    "decompress_dim_2": 320,
+    "batch_size": 64,
+    "epochs": 900
+  }
+}

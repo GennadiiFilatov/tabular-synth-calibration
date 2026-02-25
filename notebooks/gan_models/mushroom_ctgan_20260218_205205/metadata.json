@@ -1,0 +1,16 @@
+{
+  "dataset": "mushroom",
+  "method": "ctgan",
+  "timestamp": "20260218_205205",
+  "model_class": "CTGANSynthesizer",
+  "tune_info": {
+    "epochs": 1300,
+    "batch_size": 512,
+    "pac": 4,
+    "generator_lr": 0.00020307356380344237,
+    "discriminator_lr": 0.00012170293883738795,
+    "embedding_dim": 256,
+    "gen_width": 256,
+    "disc_width": 256
+  }
+}

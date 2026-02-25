@@ -1,0 +1,13 @@
+{
+  "dataset": "abalone",
+  "method": "tvae",
+  "timestamp": "20260219_024742",
+  "model_class": "TVAESynthesizer",
+  "tune_info": {
+    "epochs": 1400,
+    "batch_size": 1024,
+    "embedding_dim": 128,
+    "compress_width": 512,
+    "decompress_width": 256
+  }
+}

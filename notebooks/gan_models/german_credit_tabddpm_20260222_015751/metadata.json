@@ -1,0 +1,15 @@
+{
+  "dataset": "german_credit",
+  "method": "tabddpm",
+  "timestamp": "20260222_015751",
+  "model_class": "SyntheticDataGenerator",
+  "tune_info": {
+    "training_iterations": 800,
+    "learning_rate": 0.0011790965486776312,
+    "batch_size": 128,
+    "diffusion_timesteps": 100,
+    "dim_hidden": 256,
+    "depth": 4,
+    "dropout": 0.04125628324379797
+  }
+}
