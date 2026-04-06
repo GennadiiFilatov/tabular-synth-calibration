@@ -106,6 +106,10 @@ class ModelSelectionFramework:
 
     def _get_classification_architectures(self) -> List[ModelConfig]:
         """Define diverse classification model architectures."""
+
+        _logreg_base = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
+        _tree_base   = DecisionTreeClassifier(max_depth=10, random_state=RANDOM_SEED)
+        
         architectures = [
             # ==================== ENSEMBLE METHODS ====================
             
@@ -184,49 +188,84 @@ class ModelSelectionFramework:
                 {'kernel': 'poly', 'degree': 2, 'C': 1.0, 'probability': True, 'random_state': RANDOM_SEED}),
             ModelConfig('SVC_Linear', SVC,
                 {'kernel': 'linear', 'C': 1.0, 'probability': True, 'random_state': RANDOM_SEED}),
+            ModelConfig('SVC_Sigmoid', SVC,
+                {'kernel': 'sigmoid', 'C': 1.0, 'gamma': 'scale', 'probability': True, 'random_state': RANDOM_SEED}),
             ModelConfig('NuSVC', NuSVC,
                 {'nu': 0.5, 'kernel': 'rbf', 'probability': True, 'random_state': RANDOM_SEED}),
 
             # ==================== NEAREST NEIGHBORS ====================
 
-            ModelConfig('KNN_Uniform_5', KNeighborsClassifier,
-                {'n_neighbors': 5, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_Distance_10', KNeighborsClassifier,
-                {'n_neighbors': 10, 'weights': 'distance', 'algorithm': 'auto'}),
-            ModelConfig('KNN_Manhattan', KNeighborsClassifier,
-                {'n_neighbors': 5, 'weights': 'uniform', 'metric': 'manhattan'}),
+            ModelConfig('KNN_k3_Uniform', KNeighborsClassifier,
+                        {'n_neighbors': 3, 'weights': 'uniform', 'algorithm': 'auto'}),
+            ModelConfig('KNN_k7_Distance', KNeighborsClassifier,
+                        {'n_neighbors': 7, 'weights': 'distance', 'algorithm': 'auto'}),
+            ModelConfig('KNN_k15_Uniform', KNeighborsClassifier,
+                        {'n_neighbors': 15, 'weights': 'uniform', 'algorithm': 'auto'}),
+            ModelConfig('KNN_L1_k5_Uniform', KNeighborsClassifier,
+                        {'n_neighbors': 5, 'weights': 'uniform', 'metric': 'manhattan'}),
+            ModelConfig('KNN_L1_k10_Distance', KNeighborsClassifier,
+                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'manhattan'}),
+            ModelConfig('KNN_Cosine_k10_Distance', KNeighborsClassifier,
+                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'cosine'}),
 
             # ==================== NAIVE BAYES ====================
 
-            ModelConfig('GaussianNB', GaussianNB, {}),
-            ModelConfig('BernoulliNB', BernoulliNB, {'alpha': 1.0, 'binarize': 0.0}),
+            ModelConfig('GaussianNB_Default', GaussianNB, {}),
+            ModelConfig('GaussianNB_Smooth1e-8', GaussianNB, {'var_smoothing': 1e-8}),
+            ModelConfig('BernoulliNB_Alpha1_Bin0', BernoulliNB, {'alpha': 1.0, 'binarize': 0.0, 'fit_prior': True}),
+            ModelConfig('BernoulliNB_Alpha0p1_Bin05', BernoulliNB, {'alpha': 0.1, 'binarize': 0.5, 'fit_prior': True}),
             ModelConfig('MultinomialNB_Alpha1', MultinomialNB, {'alpha': 1.0, 'fit_prior': True}),
-            ModelConfig('ComplementNB_Alpha1', ComplementNB, {'alpha': 1.0, 'fit_prior': True}),
+            ModelConfig('MultinomialNB_Alpha0p1', MultinomialNB, {'alpha': 0.1, 'fit_prior': True}),
+            ModelConfig('ComplementNB_Alpha1_NoNorm', ComplementNB, {'alpha': 1.0, 'fit_prior': True, 'norm': False}),
+            ModelConfig('ComplementNB_Alpha1_Norm', ComplementNB, {'alpha': 1.0, 'fit_prior': True, 'norm': True}),
 
             # ==================== DISCRIMINANT ANALYSIS ====================
 
             ModelConfig('LDA_SVD', LinearDiscriminantAnalysis, {'solver': 'svd'}),
-            ModelConfig('QDA', QuadraticDiscriminantAnalysis, {'reg_param': 0.0}),
+            ModelConfig('LDA_Eigen', LinearDiscriminantAnalysis, {'solver': 'eigen'}),
+            ModelConfig('LDA_LSQR_Shrink0p1', LinearDiscriminantAnalysis, {'solver': 'lsqr', 'shrinkage': 0.1}),
+            ModelConfig('LDA_LSQR_Shrink0p5', LinearDiscriminantAnalysis, {'solver': 'lsqr', 'shrinkage': 0.5}),
+            ModelConfig('QDA_Reg0', QuadraticDiscriminantAnalysis, {'reg_param': 0.0}),
+            ModelConfig('QDA_Reg0p2', QuadraticDiscriminantAnalysis, {'reg_param': 0.2}),
+            ModelConfig('QDA_Reg0p5', QuadraticDiscriminantAnalysis, {'reg_param': 0.5}),
 
             # ==================== DECISION TREES ====================
 
-            ModelConfig('DecisionTree_Gini', DecisionTreeClassifier,
-                {'criterion': 'gini', 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_Entropy', DecisionTreeClassifier,
-                {'criterion': 'entropy', 'max_depth': 15, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTreeClassifier_Deep', ExtraTreeClassifier,
-                {'max_depth': 20, 'splitter': 'best', 'random_state': RANDOM_SEED}),
+            ModelConfig('DecisionTree_Gini_Full', DecisionTreeClassifier,
+                        {'criterion': 'gini', 'max_depth': None, 'random_state': RANDOM_SEED}),
+            ModelConfig('DecisionTree_Gini_Depth10', DecisionTreeClassifier,
+                        {'criterion': 'gini', 'max_depth': 10, 'random_state': RANDOM_SEED}),
+            ModelConfig('DecisionTree_Entropy_Depth15', DecisionTreeClassifier,
+                        {'criterion': 'entropy', 'max_depth': 15, 'random_state': RANDOM_SEED}),
+            ModelConfig('DecisionTree_Gini_RandomSplit', DecisionTreeClassifier,
+                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 8, 'random_state': RANDOM_SEED}),
+            ModelConfig('ExtraTree_Gini_Deep', ExtraTreeClassifier,
+                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 20, 'random_state': RANDOM_SEED}),
+            ModelConfig('ExtraTree_Entropy_Shallower', ExtraTreeClassifier,
+                        {'criterion': 'entropy', 'splitter': 'random', 'max_depth': 10, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
+            ModelConfig('ExtraTree_Gini_Full_MaxFeatSqrt', ExtraTreeClassifier,
+                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': None, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
+            ModelConfig('ExtraTree_Gini_Depth3', ExtraTreeClassifier,
+                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 3, 'random_state': RANDOM_SEED}),
 
             # ==================== NEURAL NETWORKS ====================
 
-            ModelConfig('MLP_ReLU_Adam', MLPClassifier,
-                {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD', MLPClassifier,
-                {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Deep', MLPClassifier,
-                {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Wide', MLPClassifier,
-                {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Mid', MLPClassifier,
+                        {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Deep', MLPClassifier,
+                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Wide', MLPClassifier,
+                        {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Small', MLPClassifier,
+                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Tanh_SGD_Mid', MLPClassifier,
+                        {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Tanh_SGD_Deep', MLPClassifier,
+                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Logistic_Adam', MLPClassifier,
+                        {'hidden_layer_sizes': (100,), 'activation': 'logistic', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_LBFGS_Small', MLPClassifier,
+                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'lbfgs', 'max_iter': 500, 'random_state': RANDOM_SEED}),
 
             # ==================== ENSEMBLE META-MODELS ====================
 
@@ -257,6 +296,24 @@ class ModelSelectionFramework:
             ModelConfig('SelfTraining_LogReg', SelfTrainingClassifier,
                 {'base_estimator': LogisticRegression(max_iter=1000, random_state=RANDOM_SEED),
                  'threshold': 0.8, 'verbose': False}),
+            
+            ModelConfig('LabelSpreading_KNN_10_a0p2', LabelSpreading,
+                        {'kernel': 'knn', 'n_neighbors': 10, 'alpha': 0.2, 'max_iter': 1000}),
+            ModelConfig('LabelSpreading_KNN_20_a0p8', LabelSpreading,
+                        {'kernel': 'knn', 'n_neighbors': 20, 'alpha': 0.8, 'max_iter': 1000}),
+            ModelConfig('LabelSpreading_RBF_g20_a0p2', LabelSpreading,
+                        {'kernel': 'rbf', 'gamma': 20.0, 'alpha': 0.2, 'max_iter': 1000}),
+            ModelConfig('LabelSpreading_RBF_g5_a0p8', LabelSpreading,
+                        {'kernel': 'rbf', 'gamma': 5.0, 'alpha': 0.8, 'max_iter': 1000}),
+
+            ModelConfig('SelfTrain_LogReg_Thr0p9', SelfTrainingClassifier,
+                        {'base_estimator': _logreg_base, 'threshold': 0.9, 'criterion': 'threshold', 'max_iter': 20, 'verbose': False}),
+            ModelConfig('SelfTrain_LogReg_Thr0p7', SelfTrainingClassifier,
+                        {'base_estimator': _logreg_base, 'threshold': 0.7, 'criterion': 'threshold', 'max_iter': 20, 'verbose': False}),
+            ModelConfig('SelfTrain_Tree_kBest5', SelfTrainingClassifier,
+                        {'base_estimator': _tree_base, 'criterion': 'k_best', 'k_best': 5, 'max_iter': 20, 'verbose': False}),
+            ModelConfig('SelfTrain_Tree_kBest20', SelfTrainingClassifier,
+                        {'base_estimator': _tree_base, 'criterion': 'k_best', 'k_best': 20, 'max_iter': 20, 'verbose': False}),
         ]
 
         return architectures
@@ -332,37 +389,70 @@ class ModelSelectionFramework:
             ModelConfig('SVR_Linear', LinearSVR, {'C': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
             ModelConfig('SVR_Poly', SVR, {'kernel': 'poly', 'degree': 2, 'C': 1.0}),
             ModelConfig('NuSVR', NuSVR, {'nu': 0.5, 'kernel': 'rbf', 'C': 1.0}),
+
+            ModelConfig('SVR_RBF_C1_e0p1', SVR, {'kernel': 'rbf', 'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale'}),
+            ModelConfig('SVR_RBF_C10_e0p01', SVR, {'kernel': 'rbf', 'C': 10.0, 'epsilon': 0.01, 'gamma': 'scale'}),
+            ModelConfig('SVR_RBF_C0p1_e0p2', SVR, {'kernel': 'rbf', 'C': 0.1, 'epsilon': 0.2, 'gamma': 'scale'}),
+            ModelConfig('LinSVR_C1', LinearSVR, {'C': 1.0, 'epsilon': 0.1, 'max_iter': 5000, 'random_state': RANDOM_SEED}),
+            ModelConfig('LinSVR_C0p1_L2Loss', LinearSVR, 
+                        {'C': 0.1, 'epsilon': 0.1, 'loss': 'squared_epsilon_insensitive', 'max_iter': 5000, 'random_state': RANDOM_SEED}),
+            ModelConfig('SVR_Poly_deg2', SVR, {'kernel': 'poly', 'degree': 2, 'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale'}),
+            ModelConfig('SVR_Poly_deg3_C10', SVR, {'kernel': 'poly', 'degree': 3, 'C': 10.0, 'epsilon': 0.1, 'gamma': 'scale'}),
+            ModelConfig('NuSVR_RBF_nu0p5', NuSVR, {'kernel': 'rbf', 'C': 1.0, 'nu': 0.5, 'gamma': 'scale'}),
             
             # ==================== NEAREST NEIGHBORS ====================
             
-            ModelConfig('KNN_Uniform_5', KNeighborsRegressor,
-                {'n_neighbors': 5, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_Distance_10', KNeighborsRegressor,
-                {'n_neighbors': 10, 'weights': 'distance', 'algorithm': 'auto'}),
-            ModelConfig('KNN_Manhattan', KNeighborsRegressor,
-                {'n_neighbors': 5, 'weights': 'distance', 'metric': 'manhattan'}),
+            ModelConfig('KNN_k3_Uniform', KNeighborsRegressor,
+                        {'n_neighbors': 3, 'weights': 'uniform', 'algorithm': 'auto'}),
+            ModelConfig('KNN_k7_Distance', KNeighborsRegressor,
+                        {'n_neighbors': 7, 'weights': 'distance', 'algorithm': 'auto'}),
+            ModelConfig('KNN_k15_Uniform', KNeighborsRegressor,
+                        {'n_neighbors': 15, 'weights': 'uniform', 'algorithm': 'auto'}),
+            ModelConfig('KNN_L1_k5_Uniform', KNeighborsRegressor,
+                        {'n_neighbors': 5, 'weights': 'uniform', 'metric': 'manhattan'}),
+            ModelConfig('KNN_L1_k10_Distance', KNeighborsRegressor,
+                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'manhattan'}),
+            ModelConfig('KNN_Cosine_k10_Distance', KNeighborsRegressor,
+                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'cosine'}),
             
             # ==================== TREE-BASED MODELS ====================
-            
-            ModelConfig('DecisionTree_MSE', DecisionTreeRegressor,
-                {'criterion': 'squared_error', 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_Shallow', DecisionTreeRegressor,
-                {'criterion': 'squared_error', 'max_depth': 10, 'min_samples_split': 10, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_MAE', DecisionTreeRegressor,
-                {'criterion': 'absolute_error', 'max_depth': 15, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTreeRegressor', ExtraTreeRegressor,
-                {'max_depth': None, 'splitter': 'random', 'random_state': RANDOM_SEED}),
+
+            ModelConfig('DTree_SqErr_Full', DecisionTreeRegressor,
+                        {'criterion': 'squared_error', 'max_depth': None, 'random_state': RANDOM_SEED}),
+            ModelConfig('DTree_SqErr_Shallow', DecisionTreeRegressor,
+                        {'criterion': 'squared_error', 'max_depth': 10, 'min_samples_split': 10, 'random_state': RANDOM_SEED}),
+            ModelConfig('DTree_SqErr_Depth15_MaxFeatSqrt', DecisionTreeRegressor,
+                        {'criterion': 'squared_error', 'max_depth': 15, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
+            ModelConfig('DTree_AbsErr_Depth15', DecisionTreeRegressor,
+                        {'criterion': 'absolute_error', 'max_depth': 15, 'random_state': RANDOM_SEED}),
+            ModelConfig('ETree_SqErr_Full', ExtraTreeRegressor,
+                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': None, 'random_state': RANDOM_SEED}),
+            ModelConfig('ETree_SqErr_Depth10', ExtraTreeRegressor,
+                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': 10, 'random_state': RANDOM_SEED}),
+            ModelConfig('ETree_AbsErr_Depth15_MaxFeatSqrt', ExtraTreeRegressor,
+                        {'criterion': 'absolute_error', 'splitter': 'random', 'max_depth': 15, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
+            ModelConfig('ETree_SqErr_Depth3', ExtraTreeRegressor,
+                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': 3, 'random_state': RANDOM_SEED}),
             
             # ==================== NEURAL NETWORKS ====================
             
-            ModelConfig('MLP_ReLU_Adam', MLPRegressor,
-                {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD', MLPRegressor,
-                {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Deep', MLPRegressor,
-                {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Wide', MLPRegressor,
-                {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Mid', MLPRegressor,
+                        {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Deep', MLPRegressor,
+                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Wide', MLPRegressor,
+                        {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_Adam_Small', MLPRegressor,
+                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Tanh_SGD_Mid', MLPRegressor,
+                        {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Tanh_SGD_Deep', MLPRegressor,
+                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_Logistic_Adam', MLPRegressor,
+                        {'hidden_layer_sizes': (100,), 'activation': 'logistic', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+            ModelConfig('MLP_ReLU_LBFGS_Small', MLPRegressor,
+                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'lbfgs', 'max_iter': 500, 'random_state': RANDOM_SEED}),
+
             
             # ==================== ENSEMBLE META-MODELS ====================
             

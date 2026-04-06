@@ -23,7 +23,7 @@ class SyntheticDataCalibrator:
     """
 
     def __init__(self, lambda_reg: float = 0.1, verbose: bool = True, 
-                 loss_type: str = 'log_loss', use_sample_wise_loss: bool = True):
+                 loss_type: str = 'log_loss', use_sample_wise_loss: bool = True, cl_type: str = 'straight'):
         """
         Args:
             lambda_reg: Regularization strength (λ)
@@ -40,8 +40,14 @@ class SyntheticDataCalibrator:
         self.loss_type = loss_type
         self.use_sample_wise_loss = use_sample_wise_loss
         
-        self.weights: np.ndarray = None
+        if cl_type == 'straight':
+            self.weights: np.ndarray = None
+        else:
+            self.weights: Dict[int, np.ndarray] = {}
+            self.sample_indices: Dict[int, np.ndarray] = {}
+
         self.fitted = False
+        self.cl_type = cl_type
         
         self.optimization_result = None
         self.loss_matrix: np.ndarray = None
@@ -102,6 +108,11 @@ class SyntheticDataCalibrator:
         """Compute average loss on real validation data."""
         sample_losses = self._compute_sample_losses(model, X_real, y_real)
         return np.mean(sample_losses)
+    
+    def _compute_real_var(self, model, X_real: pd.DataFrame, y_real: pd.Series) -> float:
+        """Compute variance on real validation data."""
+        sample_losses = self._compute_sample_losses(model, X_real, y_real)
+        return np.var(sample_losses)
 
     def fit(self, 
             calibration_models: List[Any],
@@ -114,47 +125,112 @@ class SyntheticDataCalibrator:
             w = argmin ||l_r - L^T @ w||^2 + λ||w||^2
             s.t. w >= 0
         """
-        N = len(X_synth)
-        M = len(calibration_models)
-        
-        if self.verbose:
-            print(f"\n{'='*70}")
-            print(f"CALIBRATING SYNTHETIC SAMPLES")
-            print(f"{'='*70}")
-            print(f"  λ: {self.lambda_reg}, Loss: {self.loss_type}")
-            print(f"  Calibration Models (M): {M}, Synthetic samples (N): {N}")
-        
-        L = np.zeros((N, M), dtype=np.float64)
-        l_r = np.zeros(M, dtype=np.float64)
-        
-        for m, model in enumerate(calibration_models):
+        if self.cl_type == 'straight':
+            N = len(X_synth)
+            M = len(calibration_models)
+            
             if self.verbose:
-                print(f"  Model {m+1}/{M}...", end=" ")
+                print(f"\n{'='*70}")
+                print(f"CALIBRATING SYNTHETIC SAMPLES")
+                print(f"{'='*70}")
+                print(f"  λ: {self.lambda_reg}, Loss: {self.loss_type}")
+                print(f"  Calibration Models (M): {M}, Synthetic samples (N): {N}")
+            
+            L = np.zeros((N, M), dtype=np.float64)
+            l_r = np.zeros(M, dtype=np.float64)
+            
+            for m, model in enumerate(calibration_models):
+                if self.verbose:
+                    print(f"  Model {m+1}/{M}...", end=" ")
 
-            L[:, m] = self._compute_sample_losses(model, X_synth, y_synth)
-            l_r[m] = self._compute_real_loss(model, X_real_val, y_real_val)
+                L[:, m] = self._compute_sample_losses(model, X_synth, y_synth)
+                l_r[m] = self._compute_real_loss(model, X_real_val, y_real_val)
+
+                if self.verbose:
+                    print(f"synth_loss_mean={np.mean(L[:, m]):.4f}, real_loss={l_r[m]:.4f}")
+            
+            self.loss_matrix = L
+            self.real_losses = l_r
+            
+            w_opt, opt_result = self._solve_constrained_optimization(L, l_r)
+            
+            self.weights = w_opt
+            self.optimization_result = opt_result
+            self.fitted = True
+            
+            residual = l_r - L.T @ w_opt
+            self.final_loss = np.sum(residual ** 2) + self.lambda_reg * np.sum(w_opt ** 2)
+            
+            if self.verbose:
+                print(f"  Final objective: {self.final_loss:.6f}")
+                print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
+                print(f"  Weight sum: {np.sum(w_opt):.6f}")
+                print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
+                print(f"  Max weight: {np.max(w_opt):.6f}")
+        else:
+            classes = np.intersect1d(np.unique(y_synth), np.unique(y_real_val))
 
             if self.verbose:
-                print(f"synth_loss_mean={np.mean(L[:, m]):.4f}, real_loss={l_r[m]:.4f}")
-        
-        self.loss_matrix = L
-        self.real_losses = l_r
-        
-        w_opt, opt_result = self._solve_constrained_optimization(L, l_r)
-        
-        self.weights = w_opt
-        self.optimization_result = opt_result
-        self.fitted = True
-        
-        residual = l_r - L.T @ w_opt
-        self.final_loss = np.sum(residual ** 2) + self.lambda_reg * np.sum(w_opt ** 2)
-        
-        if self.verbose:
-            print(f"  Final objective: {self.final_loss:.6f}")
-            print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
-            print(f"  Weight sum: {np.sum(w_opt):.6f}")
-            print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
-            print(f"  Max weight: {np.max(w_opt):.6f}")
+                print(f"\n{'='*70}")
+                print(f"CALIBRATING SYNTHETIC SAMPLES PER CLASS")
+                print(f"{'='*70}")
+                print(f"  Regularization: {self.lambda_reg}")
+                print(f"  Calibration models (M): {len(calibration_models)}")
+                print(f"  Real training samples: {len(X_real_val)}")
+                print(f"  Synthetic samples: {len(X_synth)}")
+                print(f"  Classes: {len(classes)}")
+                print(f"{'='*70}\n")
+            for class_label in classes:
+                synth_mask = (y_synth == class_label)
+                real_mask = (y_real_val == class_label)
+
+                indices = np.where(synth_mask)[0]
+
+                X_synth_c = X_synth.iloc[indices]
+                X_real_c = X_real_val[real_mask]
+                y_synth_c = y_synth.iloc[indices].values
+                y_real_c = y_real_val[real_mask].values
+
+                N_c = len(X_synth_c)
+                M = len(calibration_models)
+
+                if N_c == 0 or len(y_real_c) == 0:
+                    if self.verbose:
+                        print(f"  Class {class_label}: SKIPPED (empty)")
+                    continue
+
+                L = np.zeros((N_c, M))
+                l_r = np.zeros(M)
+
+                for m, model in enumerate(calibration_models):
+                    if self.verbose:
+                        print(f"  Model {m+1}/{M}...", end=" ")
+
+                    L[:, m] = self._compute_sample_losses(model, X_synth_c, y_synth_c)
+                    l_r[m] = self._compute_real_loss(model, X_real_c, y_real_c)
+
+                    if self.verbose:
+                        print(f"synth_loss_mean={np.mean(L[:, m]):.4f}, real_loss={l_r[m]:.4f}")
+                
+                w_opt, opt_result = self._solve_constrained_optimization(L, l_r)
+                
+                self.weights[class_label] = w_opt
+                self.sample_indices[class_label] = indices
+                self.optimization_result = opt_result
+
+                residual = l_r - L.T @ w_opt
+                self.final_loss = np.sum(residual ** 2) + self.lambda_reg * np.sum(w_opt ** 2)
+                    
+                if self.verbose:
+                    print(f"  Final objective: {self.final_loss:.6f}")
+                    print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N_c}")
+                    print(f"  Weight sum: {np.sum(w_opt):.6f}")
+                    print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N_c}")
+                    print(f"  Max weight: {np.max(w_opt):.6f}")
+
+            self.fitted = True
+
+
 
     def _solve_constrained_optimization(self, L: np.ndarray, l_r: np.ndarray) -> Tuple[np.ndarray, Any]:
         """Solve the constrained optimization problem."""
@@ -203,5 +279,40 @@ class SyntheticDataCalibrator:
         if not self.fitted:
             raise ValueError("Calibrator not fitted. Call fit() first.")
         
-        sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
-        return sample_losses.T @ self.weights
+        if self.cl_type == 'straight':
+            sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
+            return sample_losses.T @ self.weights
+        else:
+            sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
+
+            total_error_weighted = 0.0
+            total_samples = 0
+            
+            for class_label, w_c in self.weights.items():
+                mask = (y_synth == class_label).values
+                n_samples = np.sum(mask)
+                
+                if n_samples == 0: continue
+                l_r = sample_losses[mask]
+                
+                calibrated_class_error_rate = np.dot(l_r, w_c)
+                total_error_weighted += calibrated_class_error_rate * n_samples
+                total_samples += n_samples
+            
+            if total_samples == 0: return 0.0
+
+            return total_error_weighted / total_samples
+        
+    def compute_weights_for_samples(self, y_synth: pd.Series) -> np.ndarray:
+
+        weights = np.zeros(len(y_synth))
+        
+        for class_label, w_c in self.weights.items():
+            indices = self.sample_indices[class_label]
+            
+            if len(indices) != len(w_c):
+                raise ValueError(f"MISMATCH: {len(indices)} != {len(w_c)}")
+            
+            weights[indices] = w_c
+        
+        return weights
