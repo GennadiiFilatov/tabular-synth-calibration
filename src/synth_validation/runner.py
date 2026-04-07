@@ -40,7 +40,8 @@ class ExperimentRunner:
                  save_figures: bool = False,
                  figures_dir: str = None,
                  gan_cache_dir: str = 'gan_cache',
-                 cl_type: str = 'straight'):
+                 cl_type: str = 'straight',
+                 regression_n_bins: int = 10):
         """
         Initialize experiment runner.
         
@@ -54,6 +55,8 @@ class ExperimentRunner:
             save_figures: Whether to save generated figures
             figures_dir: Directory for saving figures
             gan_cache_dir: Directory for caching GAN models
+            cl_type: Calibration type ('straight', 'per_class')
+            regression_n_bins: Number of bins for regression calibration
         """
         self.dataset_name = dataset_name
         self.synth_method = synth_method
@@ -65,13 +68,20 @@ class ExperimentRunner:
         
         # Auto-select loss_type based on task
         if loss_type is None:
-            loss_type = 'log_loss' if task_type == 'classification' else 'mse'
+            loss_type = 'log_loss' if task_type == 'classification' else 'mae'
         self.loss_type = loss_type
         
         # Initialize components
         self.data_loader = DataLoader()
         self.model_selector = ModelSelectionFramework(task_type=task_type, loss_type=loss_type)
-        self.calibrator = SyntheticDataCalibrator(lambda_reg=lambda_reg, verbose=verbose, loss_type=loss_type, cl_type=cl_type)
+        self.calibrator = SyntheticDataCalibrator(
+            lambda_reg=lambda_reg,
+            verbose=verbose,
+            task_type=task_type,
+            loss_type=loss_type,
+            cl_type=cl_type,
+            regression_n_bins=regression_n_bins
+        )
         self.ci_estimator = ConfidenceIntervalEstimator()
         self.metrics = EvaluationMetrics()
         

@@ -22,29 +22,36 @@ class SyntheticDataCalibrator:
         - w[i] is the weight for synthetic sample i (shape: n_synth,)
     """
 
-    def __init__(self, lambda_reg: float = 0.1, verbose: bool = True, 
-                 loss_type: str = 'log_loss', use_sample_wise_loss: bool = True, cl_type: str = 'straight'):
+    def __init__(self, lambda_reg: float = 0.1, verbose: bool = True, task_type: str = 'classification', 
+                 loss_type: str = 'log_loss', use_sample_wise_loss: bool = True, cl_type: str = 'straight',
+                 regression_n_bins: int = 10):
         """
         Args:
             lambda_reg: Regularization strength (λ)
             verbose: Print logs
+            task_type: 'classification' or 'regression'
             loss_type: Type of loss to use:
                 - 'log_loss': Log-loss for classification (default)
                 - 'accuracy': 0/1 loss for classification
                 - 'mse': Mean Squared Error for regression
                 - 'mae': Mean Absolute Error for regression
             use_sample_wise_loss: If True, compute per-sample losses
+            cl_type: 'straight' (global) or 'per_class' (group-wise)
+            regression_n_bins: Number of target bins when task_type='regression' and cl_type='per_class'
         """
         self.lambda_reg = lambda_reg
         self.verbose = verbose
+        self.task_type = task_type
         self.loss_type = loss_type
         self.use_sample_wise_loss = use_sample_wise_loss
+        self.regression_n_bins = max(2, int(regression_n_bins))
+        self.group_bin_edges: Optional[np.ndarray] = None
         
-        if cl_type == 'straight':
+        if cl_type != 'per_class':
             self.weights: np.ndarray = None
         else:
-            self.weights: Dict[int, np.ndarray] = {}
-            self.sample_indices: Dict[int, np.ndarray] = {}
+            self.weights: Dict[Any, np.ndarray] = {}
+            self.sample_indices: Dict[Any, np.ndarray] = {}
 
         self.fitted = False
         self.cl_type = cl_type
@@ -53,6 +60,63 @@ class SyntheticDataCalibrator:
         self.loss_matrix: np.ndarray = None
         self.real_losses: np.ndarray = None
         self.final_loss: float = 0.0
+
+    def _to_numpy_1d(self, y: Any) -> np.ndarray:
+        """Convert targets to a flat numpy array."""
+        if hasattr(y, 'values'):
+            return np.asarray(y.values).reshape(-1)
+        return np.asarray(y).reshape(-1)
+
+    def _slice_target(self, y: Any, indices: np.ndarray) -> np.ndarray:
+        """Slice target values by integer indices."""
+        if hasattr(y, 'iloc'):
+            return np.asarray(y.iloc[indices].values)
+        y_arr = np.asarray(y)
+        return y_arr[indices]
+
+    def _assign_regression_bins(self, y: Any, bin_edges: np.ndarray) -> np.ndarray:
+        """Assign continuous targets to integer bin ids."""
+        y_arr = self._to_numpy_1d(y).astype(np.float64, copy=False)
+        internal_edges = bin_edges[1:-1]
+        return np.digitize(y_arr, internal_edges, right=True)
+
+    def _prepare_per_class_groups(self, y_synth: Any, y_real: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Prepare shared group labels for per-class/per-bin calibration."""
+        y_synth_arr = self._to_numpy_1d(y_synth)
+        y_real_arr = self._to_numpy_1d(y_real)
+
+        if self.task_type == 'regression':
+            combined_targets = np.concatenate([
+                y_synth_arr.astype(np.float64, copy=False),
+                y_real_arr.astype(np.float64, copy=False)
+            ])
+
+            n_unique = len(np.unique(combined_targets))
+            if n_unique <= 1:
+                bin_edges = np.array([-np.inf, np.inf], dtype=np.float64)
+            else:
+                n_bins = min(self.regression_n_bins, n_unique)
+                quantiles = np.linspace(0.0, 1.0, n_bins + 1)
+                raw_edges = np.quantile(combined_targets, quantiles)
+                unique_edges = np.unique(raw_edges)
+
+                if len(unique_edges) < 2:
+                    bin_edges = np.array([-np.inf, np.inf], dtype=np.float64)
+                else:
+                    bin_edges = unique_edges.astype(np.float64)
+                    bin_edges[0] = -np.inf
+                    bin_edges[-1] = np.inf
+
+            self.group_bin_edges = bin_edges
+            synth_groups = self._assign_regression_bins(y_synth_arr, bin_edges)
+            real_groups = self._assign_regression_bins(y_real_arr, bin_edges)
+        else:
+            self.group_bin_edges = None
+            synth_groups = y_synth_arr
+            real_groups = y_real_arr
+
+        shared_groups = np.intersect1d(np.unique(synth_groups), np.unique(real_groups))
+        return synth_groups, real_groups, shared_groups
 
     def _compute_sample_losses(self, model, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
         """Compute per-sample losses for a model."""
@@ -125,7 +189,7 @@ class SyntheticDataCalibrator:
             w = argmin ||l_r - L^T @ w||^2 + λ||w||^2
             s.t. w >= 0
         """
-        if self.cl_type == 'straight':
+        if self.cl_type != 'per_class':
             N = len(X_synth)
             M = len(calibration_models)
             
@@ -168,35 +232,46 @@ class SyntheticDataCalibrator:
                 print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
                 print(f"  Max weight: {np.max(w_opt):.6f}")
         else:
-            classes = np.intersect1d(np.unique(y_synth), np.unique(y_real_val))
+            self.weights = {}
+            self.sample_indices = {}
+
+            synth_groups, real_groups, groups = self._prepare_per_class_groups(y_synth, y_real_val)
+
+            if self.task_type == 'classification':
+                group_name = 'Classes'
+                header_name = 'CLASS'
+            else:
+                group_name = 'Target bins'
+                header_name = 'BIN'
 
             if self.verbose:
                 print(f"\n{'='*70}")
-                print(f"CALIBRATING SYNTHETIC SAMPLES PER CLASS")
+                print(f"CALIBRATING SYNTHETIC SAMPLES PER {header_name}")
                 print(f"{'='*70}")
                 print(f"  Regularization: {self.lambda_reg}")
                 print(f"  Calibration models (M): {len(calibration_models)}")
                 print(f"  Real training samples: {len(X_real_val)}")
                 print(f"  Synthetic samples: {len(X_synth)}")
-                print(f"  Classes: {len(classes)}")
+                print(f"  {group_name}: {len(groups)}")
+                if self.task_type == 'regression' and self.group_bin_edges is not None:
+                    print(f"  Requested bins: {self.regression_n_bins}, effective bins: {len(self.group_bin_edges) - 1}")
                 print(f"{'='*70}\n")
-            for class_label in classes:
-                synth_mask = (y_synth == class_label)
-                real_mask = (y_real_val == class_label)
+            for group_label in groups:
+                synth_indices = np.where(synth_groups == group_label)[0]
+                real_indices = np.where(real_groups == group_label)[0]
 
-                indices = np.where(synth_mask)[0]
-
-                X_synth_c = X_synth.iloc[indices]
-                X_real_c = X_real_val[real_mask]
-                y_synth_c = y_synth.iloc[indices].values
-                y_real_c = y_real_val[real_mask].values
+                X_synth_c = X_synth.iloc[synth_indices]
+                X_real_c = X_real_val.iloc[real_indices]
+                y_synth_c = self._slice_target(y_synth, synth_indices)
+                y_real_c = self._slice_target(y_real_val, real_indices)
 
                 N_c = len(X_synth_c)
                 M = len(calibration_models)
 
                 if N_c == 0 or len(y_real_c) == 0:
                     if self.verbose:
-                        print(f"  Class {class_label}: SKIPPED (empty)")
+                        singular_group_name = 'Class' if self.task_type == 'classification' else 'Bin'
+                        print(f"  {singular_group_name} {group_label}: SKIPPED (empty)")
                     continue
 
                 L = np.zeros((N_c, M))
@@ -214,8 +289,8 @@ class SyntheticDataCalibrator:
                 
                 w_opt, opt_result = self._solve_constrained_optimization(L, l_r)
                 
-                self.weights[class_label] = w_opt
-                self.sample_indices[class_label] = indices
+                self.weights[group_label] = w_opt
+                self.sample_indices[group_label] = synth_indices
                 self.optimization_result = opt_result
 
                 residual = l_r - L.T @ w_opt
@@ -279,33 +354,52 @@ class SyntheticDataCalibrator:
         if not self.fitted:
             raise ValueError("Calibrator not fitted. Call fit() first.")
         
-        if self.cl_type == 'straight':
+        if self.cl_type != 'per_class':
             sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
             return sample_losses.T @ self.weights
         else:
             sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
 
+            if self.task_type == 'regression':
+                if self.group_bin_edges is None:
+                    raise ValueError("Regression bins are not available. Call fit() first.")
+                synth_groups = self._assign_regression_bins(y_synth, self.group_bin_edges)
+            else:
+                synth_groups = self._to_numpy_1d(y_synth)
+
             total_error_weighted = 0.0
             total_samples = 0
             
-            for class_label, w_c in self.weights.items():
-                mask = (y_synth == class_label).values
-                n_samples = np.sum(mask)
+            for group_label, w_c in self.weights.items():
+                mask = (synth_groups == group_label)
+                n_samples = int(np.sum(mask))
                 
-                if n_samples == 0: continue
+                if n_samples == 0:
+                    continue
                 l_r = sample_losses[mask]
+
+                if len(l_r) != len(w_c):
+                    raise ValueError(f"MISMATCH for group {group_label}: {len(l_r)} != {len(w_c)}")
                 
-                calibrated_class_error_rate = np.dot(l_r, w_c)
-                total_error_weighted += calibrated_class_error_rate * n_samples
+                calibrated_group_error_rate = np.dot(l_r, w_c)
+                total_error_weighted += calibrated_group_error_rate * n_samples
                 total_samples += n_samples
             
-            if total_samples == 0: return 0.0
+            if total_samples == 0:
+                return 0.0
 
             return total_error_weighted / total_samples
         
     def compute_weights_for_samples(self, y_synth: pd.Series) -> np.ndarray:
+        if not self.fitted:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
 
-        weights = np.zeros(len(y_synth))
+        if self.cl_type != 'per_class':
+            if self.weights is None:
+                raise ValueError("Weights are not available.")
+            return self.weights.copy()
+
+        weights = np.zeros(len(y_synth), dtype=np.float64)
         
         for class_label, w_c in self.weights.items():
             indices = self.sample_indices[class_label]
