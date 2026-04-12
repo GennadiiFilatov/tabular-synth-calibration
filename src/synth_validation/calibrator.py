@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Tuple
-from scipy.optimize import minimize, Bounds
+from scipy.optimize import minimize, Bounds, BFGS, LinearConstraint
 
 
 class SyntheticDataCalibrator:
@@ -410,3 +410,407 @@ class SyntheticDataCalibrator:
             weights[indices] = w_c
         
         return weights
+
+
+
+class SyntheticBPRCalibrator:
+    """Calibrate synthetic sample weights using a BPR-style objective.
+
+    This calibrator learns a box-constrained weight vector over synthetic
+    samples so that model ranking induced by weighted synthetic losses matches
+    the ranking observed on real validation losses.
+    """
+
+    def __init__(self, eps: float = 0.0, beta: float = 1.0, lambda_reg: float = 0.5, mu: float = 0.0, 
+                 verbose: bool = False, task_type: str = 'classification', loss_type: str = 'log_loss'):
+        """Initialize the BPR calibrator.
+
+        Args:
+            eps: Preference threshold for building pairwise model comparisons.
+            beta: Sigmoid temperature for BPR margins.
+            lambda_reg: L2 regularization strength on sample weights.
+            mu: KL-regularization strength toward a uniform prior.
+            verbose: Whether to print progress and diagnostics.
+            task_type: Task type, either 'classification' or 'regression'.
+            loss_type: Loss to compute per sample.
+        """
+        self.eps = eps
+        self.beta = beta
+        self.lambda_reg = lambda_reg
+        self.mu = mu
+
+        self.task_type = task_type
+        self.loss_type = loss_type
+
+        self.verbose = verbose
+
+        self.weights: np.ndarray = None
+        self.fitted = False
+
+        self.pref_set: np.ndarray = None
+        self.diff_matrix: np.ndarray = None
+        self.loss_matrix: np.ndarray = None
+        self.real_losses: np.ndarray = None
+        
+        self.optimization_result = None
+        self.final_loss: float = 0.0
+
+    def _to_numpy_1d(self, y: Any) -> np.ndarray:
+        """Convert targets to a flat numpy array.
+
+        Args:
+            y: Target values as numpy array, pandas Series, or similar.
+
+        Returns:
+            Flattened target array.
+        """
+        if hasattr(y, 'values'):
+            return np.asarray(y.values).reshape(-1)
+        return np.asarray(y).reshape(-1)
+
+    def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
+        """Compute per-sample losses for a model.
+
+        Args:
+            model: Trained sklearn-compatible model.
+            X: Feature matrix.
+            y: Ground-truth targets.
+
+        Returns:
+            Per-sample loss vector with shape (n_samples,).
+        """
+        n_samples = len(X)
+        y_arr = y.values if hasattr(y, 'values') else np.array(y)
+
+        if self.loss_type == 'log_loss':
+            if not hasattr(model, "predict_proba"):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+
+            try:
+                proba = model.predict_proba(X)
+            except (ValueError, RuntimeError):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+
+            if np.any(np.isnan(proba)):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+
+            classes = model.classes_
+            eps = 1e-15
+            proba = np.clip(proba, eps, 1 - eps)
+
+            sample_losses = np.full(n_samples, -np.log(eps), dtype=np.float64)
+
+            for i in range(n_samples):
+                true_label = y_arr[i]
+                class_idx = np.where(classes == true_label)[0]
+                if len(class_idx) == 0:
+                    continue
+                sample_losses[i] = -np.log(proba[i, class_idx[0]])
+
+            return sample_losses
+
+        elif self.loss_type == 'accuracy':
+            preds = model.predict(X)
+            return (preds != y_arr).astype(np.float64)
+
+        elif self.loss_type == 'mse':
+            preds = model.predict(X)
+            return ((preds - y_arr) ** 2).astype(np.float64)
+
+        elif self.loss_type == 'mae':
+            preds = model.predict(X)
+            return np.abs(preds - y_arr).astype(np.float64)
+
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+    def _compute_real_loss(self, model: Any, X_real: pd.DataFrame, y_real: pd.Series) -> float:
+        """Compute average loss on real validation data.
+
+        Args:
+            model: Trained sklearn-compatible model.
+            X_real: Real validation features.
+            y_real: Real validation targets.
+
+        Returns:
+            Mean loss on real validation data.
+        """
+        sample_losses = self._compute_sample_losses(model, X_real, y_real)
+        return np.mean(sample_losses)
+
+    def _simplex_project(self, v: np.ndarray) -> np.ndarray:
+        """Project vector onto the probability simplex.
+
+        Args:
+            v: Input vector.
+
+        Returns:
+            Euclidean projection of ``v`` onto ``{w: sum(w)=1, w>=0}``.
+        """
+        n = len(v)
+        u = np.sort(v)[::-1]
+        cssv = np.cumsum(u)
+        rho_candidates = np.nonzero(u * np.arange(1, n + 1) > (cssv - 1))[0]
+        rho = int(rho_candidates[-1]) if len(rho_candidates) > 0 else 0
+        theta = (cssv[rho] - 1.0) / float(rho + 1)
+        return np.maximum(v - theta, 0.0)
+
+    def _build_pref_set(self, r: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Build pairwise model preferences from real-data losses.
+
+        Args:
+            r: Real-data mean losses per model, shape (M,).
+            eps: Preference threshold.
+
+        Returns:
+            Tuple containing:
+                - pref_pairs: Integer index pairs (a, b), shape (|P|, 2)
+                - d: Preference strengths, shape (|P|,)
+        """
+        m_models = len(r)
+        pref_pairs_list: List[Tuple[int, int]] = []
+        d_list: List[float] = []
+
+        for a in range(m_models):
+            for b in range(m_models):
+                if a == b:
+                    continue
+                if r[a] > r[b] + eps:
+                    pref_pairs_list.append((a, b))
+                    #d_list.append(float(r[a] - r[b]))
+                    d_list.append(float(r[a] - r[b]))
+
+        if len(pref_pairs_list) == 0:
+            if self.verbose:
+                print("  WARNING: Empty preference set after eps filtering; falling back to all ordered pairs with uniform weights.")
+            for a in range(m_models):
+                for b in range(m_models):
+                    if a != b:
+                        pref_pairs_list.append((a, b))
+            d = np.ones(len(pref_pairs_list), dtype=np.float64)
+        else:
+            d = np.asarray(d_list, dtype=np.float64)
+
+        if len(pref_pairs_list) > 0:
+            pref_pairs = np.asarray(pref_pairs_list, dtype=np.int64)
+        else:
+            pref_pairs = np.empty((0, 2), dtype=np.int64)
+            d = np.empty((0,), dtype=np.float64)
+
+        self.pref_set = pref_pairs
+        return pref_pairs, d
+
+    def _build_diff_matrix(self, L: np.ndarray, pref_pairs: np.ndarray) -> np.ndarray:
+        """Build BPR difference matrix.
+
+        Args:
+            L: Synthetic loss matrix with shape (Ns, M).
+            pref_pairs: Preference pairs with shape (|P|, 2).
+
+        Returns:
+            Difference matrix D with shape (|P|, Ns), where
+            D[(a,b), i] = L[i, b] - L[i, a].
+        """
+        if pref_pairs.size == 0:
+            D = np.zeros((0, L.shape[0]), dtype=np.float64)
+        else:
+            a_idx = pref_pairs[:, 0]
+            b_idx = pref_pairs[:, 1]
+            D = (L[:, b_idx] - L[:, a_idx]).T.astype(np.float64, copy=False)
+
+        self.diff_matrix = D
+        return D
+
+    def _compute_bpr_objective(self, w: np.ndarray, D: np.ndarray, d: np.ndarray) -> float:
+        """Compute BPR objective value for current weights.
+
+        Args:
+            w: Current sample weights, shape (Ns,).
+            D: Difference matrix, shape (|P|, Ns).
+            d: Preference weights, shape (|P|,).
+
+        Returns:
+            Scalar objective value.
+        """
+        n_samples = len(w)
+        u = 1.0 / n_samples
+
+        margins = D @ w
+        logits = np.clip(self.beta * margins, -500.0, 500.0)
+        sigmoid_vals = 1.0 / (1.0 + np.exp(-logits))
+
+        bpr_term = -float(d @ np.log(sigmoid_vals + 1e-15))
+        l2_term = self.lambda_reg * float(np.sum(w ** 2))
+        w_clip = np.maximum(w, 1e-15)
+        kl_term = self.mu * float(np.sum(w * (np.log(w_clip) - np.log(u))))
+
+        return bpr_term + l2_term + kl_term
+
+    def _solve_bpr_optimization(self, L: np.ndarray, r: np.ndarray) -> Tuple[np.ndarray, List[float]]:
+        """Solve BPR optimization using L-BFGS-B with box constraints.
+
+        Args:
+            L: Synthetic loss matrix, shape (Ns, M).
+            r: Real-data model losses, shape (M,).
+
+        Returns:
+            Tuple containing:
+                - w_opt: Optimized weights, shape (Ns,)
+                - loss_history: Objective values over optimization
+        """
+        n_samples = L.shape[0]
+        if n_samples <= 0:
+            raise ValueError("Synthetic dataset must contain at least one sample.")
+
+        pref_pairs, d = self._build_pref_set(r, self.eps)
+        D = self._build_diff_matrix(L, pref_pairs)
+
+        w0 = np.ones(n_samples, dtype=np.float64) / n_samples
+        u = 1.0 / n_samples
+        log_u = np.log(u)
+
+        def objective(w: np.ndarray) -> float:
+            return self._compute_bpr_objective(w, D, d)
+
+        def gradient(w: np.ndarray) -> np.ndarray:
+            margins = D @ w
+            neg_logits = np.clip(-self.beta * margins, -500.0, 500.0)
+            sigma_neg = 1.0 / (1.0 + np.exp(-neg_logits))
+
+            w_clip = np.maximum(w, 1e-15)
+            grad = (
+                -self.beta * (D.T @ (d * sigma_neg))
+                + 2.0 * self.lambda_reg * w
+                + self.mu * (np.log(w_clip) - log_u + 1.0)
+            )
+            return grad
+
+        loss_history: List[float] = [objective(w0)]
+
+        def callback(wk: np.ndarray, state: Any) -> None:
+            loss_history.append(objective(wk))
+
+        result = minimize(
+            objective, w0,
+            method='trust-constr',
+            jac=gradient,
+            hess=BFGS(),
+            bounds=Bounds(lb=1e-8, ub=1.0, keep_feasible=True),
+            constraints=LinearConstraint(A=np.ones((1, n_samples)), 
+                                         lb=1.0, ub=1.0, keep_feasible=True),
+            callback=callback,
+            options={
+                'maxiter': 1000,
+                'gtol': 1e-8,
+                'xtol': 1e-10,
+                'initial_constr_penalty': 1.0,
+                'initial_barrier_parameter': 0.01,  # чем меньше, тем дальше от границы
+                'initial_barrier_tolerance': 0.01,
+                'verbose': 0
+            }
+        )
+
+        final_loss = objective(result.x)
+        if len(loss_history) == 0 or not np.isclose(loss_history[-1], final_loss):
+            loss_history.append(final_loss)
+
+        self.optimization_result = result
+
+        return result.x, loss_history
+
+    def fit(self,
+            calibration_models: List[Any],
+            X_synth: pd.DataFrame, y_synth: pd.Series,
+            X_real_val: pd.DataFrame, y_real_val: pd.Series) -> None:
+        """Fit BPR calibration weights on synthetic samples.
+
+        Args:
+            calibration_models: Fitted calibration models.
+            X_synth: Synthetic feature matrix.
+            y_synth: Synthetic targets.
+            X_real_val: Real validation feature matrix.
+            y_real_val: Real validation targets.
+        """
+        n_samples = len(X_synth)
+        n_models = len(calibration_models)
+        if n_samples <= 0:
+            raise ValueError("Synthetic dataset must contain at least one sample.")
+        if n_models <= 0:
+            raise ValueError("At least one calibration model is required.")
+
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("CALIBRATING SYNTHETIC SAMPLES (BPR)")
+            print(f"{'='*70}")
+            print(f"  Calibration Models (M): {n_models}, Synthetic samples (Ns): {n_samples}")
+            print(f"  eps: {self.eps}, beta: {self.beta}, lambda: {self.lambda_reg}, mu: {self.mu}")
+
+        L = np.zeros((n_samples, n_models), dtype=np.float64)
+        r = np.zeros(n_models, dtype=np.float64)
+
+        for m, model in enumerate(calibration_models):
+            if self.verbose:
+                print(f"  Model {m+1}/{n_models}...", end=" ")
+
+            L[:, m] = self._compute_sample_losses(model, X_synth, y_synth)
+            r[m] = self._compute_real_loss(model, X_real_val, y_real_val)
+
+            if self.verbose:
+                print(f"synth_loss_mean={np.mean(L[:, m]):.4f}, real_loss={r[m]:.4f}")
+
+        w_opt, loss_history = self._solve_bpr_optimization(L, r)
+
+        self.weights = w_opt
+        self.loss_matrix = L
+        self.real_losses = r
+        self.fitted = True
+        self.final_loss = float(loss_history[-1]) if len(loss_history) > 0 else 0.0
+
+        if len(loss_history) > 0:
+            plt.semilogy(loss_history)
+            plt.xlabel('Iteration')
+            plt.ylabel('Loss (log scale)')
+            plt.grid(True)
+            plt.show()
+
+        if self.verbose:
+            print(f"  Final objective: {self.final_loss:.6f}")
+            print(f"  Non-zero weights: {np.sum(self.weights > 1e-8)}/{n_samples}")
+            print(f"  Weight sum: {np.sum(self.weights):.6f}")
+            print(f"  Max weight: {np.max(self.weights):.6f}")
+
+    def evaluate_calibrated_loss(self, model: Any, X_synth: pd.DataFrame,
+                                 y_synth: pd.Series) -> float:
+        """Evaluate weighted synthetic loss for a model.
+
+        Args:
+            model: Trained model to evaluate.
+            X_synth: Synthetic feature matrix.
+            y_synth: Synthetic targets.
+
+        Returns:
+            Weighted synthetic loss scalar.
+        """
+        if not self.fitted:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
+
+        sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
+        return float(sample_losses @ self.weights)
+
+    def compute_weights_for_samples(self, y_synth: Optional[pd.Series] = None) -> np.ndarray:
+        """Return full sample weight vector.
+
+        Args:
+            y_synth: Unused. Present only for API compatibility.
+
+        Returns:
+            Copy of calibrated sample weights.
+        """
+        if not self.fitted:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
+        if self.weights is None:
+            raise ValueError("Weights are not available.")
+        return self.weights.copy()
