@@ -42,22 +42,6 @@ tabular-synth-calibration/
 │   └── experiment_figures         # Figures of each exepriment
 └── README.md                      # This file
 ```
-
-### Package Modules
-
-| Module | Main Class | Description |
-|--------|------------|-------------|
-| `runner.py` | `ExperimentRunner` | K-fold calibration experiment orchestration |
-| `calibrator.py` | `SyntheticDataCalibrator` | L-BFGS-B constrained optimization for sample weights |
-| `shap_analizer.py` | `SHAPWeightAnalizer` | CatBoost-based dual SHAP analysis |
-| `data_loader.py` | `DataLoader` | UCI dataset loading and preprocessing |
-| `generation.py` | `SyntheticDataGenerator` | Synthetic data generation (CTGAN, TVAE, etc.) |
-| `models.py` | `ModelSelectionFramework` | 44 ML model architectures for evaluation |
-| `metrics.py` | `EvaluationMetrics` | Spearman correlation, rank preservation metrics |
-| `confidence.py` | `ConfidenceIntervalEstimator` | analytical confidence intervals |
-| `theory.py` | `TheoreticalFramework` | Total variation and rank preservation theory |
-| `utils.py` | - | Random seeds and utility functions |
-
 ---
 
 ## Quick Start
