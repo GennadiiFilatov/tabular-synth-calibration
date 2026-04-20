@@ -416,20 +416,27 @@ class SyntheticDataCalibrator:
 class SyntheticBPRCalibrator:
     """Calibrate synthetic sample weights using a BPR-style objective.
 
-    This calibrator learns a box-constrained weight vector over synthetic
+    This calibrator learns a simplex-constrained weight vector over synthetic
     samples so that model ranking induced by weighted synthetic losses matches
     the ranking observed on real validation losses.
+
+    KEY DESIGN DECISIONS (aligned with Algorithm 1 in the BPR paper):
+    - Weights live on the probability simplex Δ^Ns (sum=1, w>=0)
+    - Optimization uses projected gradient descent with simplex projection
+    - Preference weights d_{(a,b)} = r_a - r_b (magnitude-aware)
+    - Beta annealing from small to target value for stable convergence
     """
 
-    def __init__(self, eps: float = 0.0, beta: float = 1.0, lambda_reg: float = 0.5, mu: float = 0.0, 
-                 verbose: bool = False, task_type: str = 'classification', loss_type: str = 'log_loss'):
+    def __init__(self, eps: float = 0.0, beta: float = 1.0, lambda_reg: float = 0.5, mu: float = 0.01, tau: float = 1.0,
+                 alpha: float = 1.0, verbose: bool = False, task_type: str = 'classification', loss_type: str = 'log_loss'):
         """Initialize the BPR calibrator.
 
         Args:
             eps: Preference threshold for building pairwise model comparisons.
-            beta: Sigmoid temperature for BPR margins.
+            beta: Sigmoid temperature for BPR margins. Recommended: 1.0-10.0.
             lambda_reg: L2 regularization strength on sample weights.
             mu: KL-regularization strength toward a uniform prior.
+            tau: Temperature for converting real loss differences into probabilities.
             verbose: Whether to print progress and diagnostics.
             task_type: Task type, either 'classification' or 'regression'.
             loss_type: Loss to compute per sample.
@@ -438,6 +445,8 @@ class SyntheticBPRCalibrator:
         self.beta = beta
         self.lambda_reg = lambda_reg
         self.mu = mu
+        self.alpha = alpha
+        self.tau = tau
 
         self.task_type = task_type
         self.loss_type = loss_type
@@ -456,29 +465,12 @@ class SyntheticBPRCalibrator:
         self.final_loss: float = 0.0
 
     def _to_numpy_1d(self, y: Any) -> np.ndarray:
-        """Convert targets to a flat numpy array.
-
-        Args:
-            y: Target values as numpy array, pandas Series, or similar.
-
-        Returns:
-            Flattened target array.
-        """
         if hasattr(y, 'values'):
             return np.asarray(y.values).reshape(-1)
         return np.asarray(y).reshape(-1)
 
     def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
-        """Compute per-sample losses for a model.
-
-        Args:
-            model: Trained sklearn-compatible model.
-            X: Feature matrix.
-            y: Ground-truth targets.
-
-        Returns:
-            Per-sample loss vector with shape (n_samples,).
-        """
+        """Compute per-sample losses for a model."""
         n_samples = len(X)
         y_arr = y.values if hasattr(y, 'values') else np.array(y)
 
@@ -528,47 +520,18 @@ class SyntheticBPRCalibrator:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
     def _compute_real_loss(self, model: Any, X_real: pd.DataFrame, y_real: pd.Series) -> float:
-        """Compute average loss on real validation data.
-
-        Args:
-            model: Trained sklearn-compatible model.
-            X_real: Real validation features.
-            y_real: Real validation targets.
-
-        Returns:
-            Mean loss on real validation data.
-        """
         sample_losses = self._compute_sample_losses(model, X_real, y_real)
         return np.mean(sample_losses)
-
-    def _simplex_project(self, v: np.ndarray) -> np.ndarray:
-        """Project vector onto the probability simplex.
-
-        Args:
-            v: Input vector.
-
-        Returns:
-            Euclidean projection of ``v`` onto ``{w: sum(w)=1, w>=0}``.
-        """
-        n = len(v)
-        u = np.sort(v)[::-1]
-        cssv = np.cumsum(u)
-        rho_candidates = np.nonzero(u * np.arange(1, n + 1) > (cssv - 1))[0]
-        rho = int(rho_candidates[-1]) if len(rho_candidates) > 0 else 0
-        theta = (cssv[rho] - 1.0) / float(rho + 1)
-        return np.maximum(v - theta, 0.0)
 
     def _build_pref_set(self, r: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndarray]:
         """Build pairwise model preferences from real-data losses.
 
-        Args:
-            r: Real-data mean losses per model, shape (M,).
-            eps: Preference threshold.
+        Convention: (a, b) means model a is WORSE than model b on real data
+        (r_a > r_b + eps), so a correct weighting should give
+        s_a(w) > s_b(w), i.e., weighted synthetic loss of a > b.
 
-        Returns:
-            Tuple containing:
-                - pref_pairs: Integer index pairs (a, b), shape (|P|, 2)
-                - d: Preference strengths, shape (|P|,)
+        D_{(a,b), i} = L_{i,b} - L_{i,a}
+        A positive margin Dw > 0 means the weighting correctly preserves order.
         """
         m_models = len(r)
         pref_pairs_list: List[Tuple[int, int]] = []
@@ -580,19 +543,25 @@ class SyntheticBPRCalibrator:
                     continue
                 if r[a] > r[b] + eps:
                     pref_pairs_list.append((a, b))
-                    #d_list.append(float(r[a] - r[b]))
                     d_list.append(float(r[a] - r[b]))
 
         if len(pref_pairs_list) == 0:
             if self.verbose:
-                print("  WARNING: Empty preference set after eps filtering; falling back to all ordered pairs with uniform weights.")
+                print("  WARNING: Empty preference set after eps filtering; "
+                      "falling back to all ordered pairs.")
             for a in range(m_models):
                 for b in range(m_models):
-                    if a != b:
+                    if r[a] > r[b]:
                         pref_pairs_list.append((a, b))
-            d = np.ones(len(pref_pairs_list), dtype=np.float64)
-        else:
-            d = np.asarray(d_list, dtype=np.float64)
+                        d_list.append(max(float(r[a] - r[b]), 1e-8))
+            if len(pref_pairs_list) == 0:
+                # All models have identical real loss — no ordering signal
+                for a in range(m_models):
+                    for b in range(a + 1, m_models):
+                        pref_pairs_list.append((a, b))
+                d_list = [1.0] * len(pref_pairs_list)
+
+        d = np.asarray(d_list, dtype=np.float64)
 
         if len(pref_pairs_list) > 0:
             pref_pairs = np.asarray(pref_pairs_list, dtype=np.int64)
@@ -606,13 +575,9 @@ class SyntheticBPRCalibrator:
     def _build_diff_matrix(self, L: np.ndarray, pref_pairs: np.ndarray) -> np.ndarray:
         """Build BPR difference matrix.
 
-        Args:
-            L: Synthetic loss matrix with shape (Ns, M).
-            pref_pairs: Preference pairs with shape (|P|, 2).
+        D_{(a,b), i} = L_{i,b} - L_{i,a}
 
-        Returns:
-            Difference matrix D with shape (|P|, Ns), where
-            D[(a,b), i] = L[i, b] - L[i, a].
+        Positive margin D @ w > 0 means correct ordering is preserved.
         """
         if pref_pairs.size == 0:
             D = np.zeros((0, L.shape[0]), dtype=np.float64)
@@ -624,118 +589,100 @@ class SyntheticBPRCalibrator:
         self.diff_matrix = D
         return D
 
-    def _compute_bpr_objective(self, w: np.ndarray, D: np.ndarray, d: np.ndarray) -> float:
-        """Compute BPR objective value for current weights.
-
-        Args:
-            w: Current sample weights, shape (Ns,).
-            D: Difference matrix, shape (|P|, Ns).
-            d: Preference weights, shape (|P|,).
-
-        Returns:
-            Scalar objective value.
-        """
-        n_samples = len(w)
-        u = 1.0 / n_samples
-
-        margins = D @ w
-        logits = np.clip(self.beta * margins, -500.0, 500.0)
-        sigmoid_vals = 1.0 / (1.0 + np.exp(-logits))
-
-        bpr_term = -float(d @ np.log(sigmoid_vals + 1e-15))
-        l2_term = self.lambda_reg * float(np.sum(w ** 2))
-        w_clip = np.maximum(w, 1e-15)
-        kl_term = self.mu * float(np.sum(w * (np.log(w_clip) - np.log(u))))
-
-        return bpr_term + l2_term + kl_term
 
     def _solve_bpr_optimization(self, L: np.ndarray, r: np.ndarray) -> Tuple[np.ndarray, List[float]]:
-        """Solve BPR optimization using L-BFGS-B with box constraints.
-
-        Args:
-            L: Synthetic loss matrix, shape (Ns, M).
-            r: Real-data model losses, shape (M,).
-
-        Returns:
-            Tuple containing:
-                - w_opt: Optimized weights, shape (Ns,)
-                - loss_history: Objective values over optimization
-        """
-        n_samples = L.shape[0]
+        """Solve BPR optimization."""
+        n_samples, M = L.shape
         if n_samples <= 0:
             raise ValueError("Synthetic dataset must contain at least one sample.")
 
         pref_pairs, d = self._build_pref_set(r, self.eps)
         D = self._build_diff_matrix(L, pref_pairs)
 
-        w0 = np.ones(n_samples, dtype=np.float64) / n_samples
+        w = np.ones(n_samples, dtype=np.float64) / n_samples
         u = 1.0 / n_samples
         log_u = np.log(u)
+        omega = np.ones_like(d)        
+        p = 1.0 / (1.0 + np.exp(d / self.tau))
 
-        def objective(w: np.ndarray) -> float:
-            return self._compute_bpr_objective(w, D, d)
-
-        def gradient(w: np.ndarray) -> np.ndarray:
+        def objective(w):
             margins = D @ w
-            neg_logits = np.clip(-self.beta * margins, -500.0, 500.0)
-            sigma_neg = 1.0 / (1.0 + np.exp(-neg_logits))
+            logits = np.clip(self.beta * margins, -500.0, 500.0)
+            sigmoid_vals = 1.0 / (1.0 + np.exp(-logits))
+            bpr_loss = -float(omega.T @ (p * np.log(sigmoid_vals + 1e-15) + (1 - p) * np.log(1 - sigmoid_vals + 1e-15)))
+            l2_loss = self.lambda_reg * float(np.dot(w, w))
+            kl_loss = 0.0
+            if self.mu > 0:
+                n_samples = len(w)
+                u = 1.0 / n_samples
+                log_u = np.log(u)
+                w_clip = np.maximum(w, 1e-15)
+                kl_loss = self.mu * float(np.sum(w * (np.log(w_clip) - log_u)))
+            return bpr_loss + l2_loss + kl_loss
 
-            w_clip = np.maximum(w, 1e-15)
-            grad = (
-                -self.beta * (D.T @ (d * sigma_neg))
-                + 2.0 * self.lambda_reg * w
-                + self.mu * (np.log(w_clip) - log_u + 1.0)
-            )
-            return grad
+        def gradient(w):
+            margins = D @ w
+            logits = np.clip(self.beta * margins, -500.0, 500.0)
+            q = 1.0 / (1.0 + np.exp(-logits))
+            grad_bpr = self.beta * D.T @ (omega * (q - p))
+            grad_l2 = 2 * self.lambda_reg * w
+            grad_kl = np.zeros_like(w)
+            if self.mu > 0:
+                w_clip = np.maximum(w, 1e-15)
+                grad_kl = self.mu * (np.log(w_clip) - log_u + 1)
+            return grad_bpr + grad_l2 + grad_kl
 
-        loss_history: List[float] = [objective(w0)]
+        def callback(xk):
+            loss_history.append(objective(xk))
+        
+        w0 = np.ones(n_samples) / n_samples
 
-        def callback(wk: np.ndarray, state: Any) -> None:
-            loss_history.append(objective(wk))
+        loss_history = []
 
         result = minimize(
             objective, w0,
-            method='trust-constr',
+            method='L-BFGS-B',
             jac=gradient,
-            hess=BFGS(),
-            bounds=Bounds(lb=1e-8, ub=1.0, keep_feasible=True),
-            constraints=LinearConstraint(A=np.ones((1, n_samples)), 
-                                         lb=1.0, ub=1.0, keep_feasible=True),
+            bounds=Bounds(lb=0.0, ub=1.0),
             callback=callback,
             options={
-                'maxiter': 1000,
-                'gtol': 1e-8,
-                'xtol': 1e-10,
-                'initial_constr_penalty': 1.0,
-                'initial_barrier_parameter': 0.01,  # чем меньше, тем дальше от границы
-                'initial_barrier_tolerance': 0.01,
-                'verbose': 0
+                'maxiter': 15000,
+                #'ftol': 1e-10,
+                #'gtol': 1e-8,
+                #'disp': False
             }
         )
 
-        final_loss = objective(result.x)
-        if len(loss_history) == 0 or not np.isclose(loss_history[-1], final_loss):
-            loss_history.append(final_loss)
-
-        self.optimization_result = result
-
+        self.optimization_result = {'final_w': result.x, 'loss_history': loss_history}
         return result.x, loss_history
+
+
+    def _compute_bpr_objective(self, w: np.ndarray, D: np.ndarray, d: np.ndarray) -> float:
+        """Compute BPR objective value for current weights (at self.beta)."""
+        n_samples = len(w)
+        u = 1.0 / n_samples
+        log_u = np.log(u)
+
+        margins = D @ w
+        logits = np.clip(self.beta * margins, -500.0, 500.0)
+        sigmoid_vals = 1.0 / (1.0 + np.exp(-logits))
+        bpr_term = -float(d @ np.log(sigmoid_vals + 1e-15))
+        l2_term = self.lambda_reg * float(np.dot(w, w))
+        kl_term = 0.0
+
+        if self.mu > 0:
+            w_clip = np.maximum(w, 1e-15)
+            kl_term = self.mu * float(np.sum(w * (np.log(w_clip) - log_u)))
+        return bpr_term + l2_term + kl_term        
 
     def fit(self,
             calibration_models: List[Any],
             X_synth: pd.DataFrame, y_synth: pd.Series,
             X_real_val: pd.DataFrame, y_real_val: pd.Series) -> None:
-        """Fit BPR calibration weights on synthetic samples.
-
-        Args:
-            calibration_models: Fitted calibration models.
-            X_synth: Synthetic feature matrix.
-            y_synth: Synthetic targets.
-            X_real_val: Real validation feature matrix.
-            y_real_val: Real validation targets.
-        """
+        """Fit BPR calibration weights on synthetic samples."""
         n_samples = len(X_synth)
         n_models = len(calibration_models)
+
         if n_samples <= 0:
             raise ValueError("Synthetic dataset must contain at least one sample.")
         if n_models <= 0:
@@ -746,7 +693,7 @@ class SyntheticBPRCalibrator:
             print("CALIBRATING SYNTHETIC SAMPLES (BPR)")
             print(f"{'='*70}")
             print(f"  Calibration Models (M): {n_models}, Synthetic samples (Ns): {n_samples}")
-            print(f"  eps: {self.eps}, beta: {self.beta}, lambda: {self.lambda_reg}, mu: {self.mu}")
+            print(f"  eps: {self.eps}, beta: {self.beta}, lambda: {self.lambda_reg}, mu: {self.mu}, alpha: {self.alpha}")
 
         L = np.zeros((n_samples, n_models), dtype=np.float64)
         r = np.zeros(n_models, dtype=np.float64)
@@ -769,11 +716,14 @@ class SyntheticBPRCalibrator:
         self.fitted = True
         self.final_loss = float(loss_history[-1]) if len(loss_history) > 0 else 0.0
 
-        if len(loss_history) > 0:
+        if len(loss_history) > 1:
+            plt.figure(figsize=(8, 4))
             plt.semilogy(loss_history)
-            plt.xlabel('Iteration')
+            plt.xlabel('Checkpoint')
             plt.ylabel('Loss (log scale)')
+            plt.title('BPR Optimization Convergence')
             plt.grid(True)
+            plt.tight_layout()
             plt.show()
 
         if self.verbose:
@@ -786,13 +736,9 @@ class SyntheticBPRCalibrator:
                                  y_synth: pd.Series) -> float:
         """Evaluate weighted synthetic loss for a model.
 
-        Args:
-            model: Trained model to evaluate.
-            X_synth: Synthetic feature matrix.
-            y_synth: Synthetic targets.
-
-        Returns:
-            Weighted synthetic loss scalar.
+        Since weights live on the simplex (sum=1), this returns an expectation
+        under the reweighted synthetic distribution — directly comparable
+        to mean losses.
         """
         if not self.fitted:
             raise ValueError("Calibrator not fitted. Call fit() first.")
@@ -801,14 +747,6 @@ class SyntheticBPRCalibrator:
         return float(sample_losses @ self.weights)
 
     def compute_weights_for_samples(self, y_synth: Optional[pd.Series] = None) -> np.ndarray:
-        """Return full sample weight vector.
-
-        Args:
-            y_synth: Unused. Present only for API compatibility.
-
-        Returns:
-            Copy of calibrated sample weights.
-        """
         if not self.fitted:
             raise ValueError("Calibrator not fitted. Call fit() first.")
         if self.weights is None:

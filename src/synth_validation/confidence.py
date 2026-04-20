@@ -275,6 +275,22 @@ class ConfidenceIntervalEstimator:
             return np.nan, np.nan
         corr, pval = stats.spearmanr(x, y)
         return corr, pval
+    
+    def compute_kendall(self, x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """
+        Compute Kendall tau-b rank correlation coefficient.
+
+        Args:
+            x: First array (e.g. real losses)
+            y: Second array (e.g. synthetic losses)
+
+        Returns:
+            Tuple of (tau, p-value)
+        """
+        if len(x) < 3:
+            return np.nan, np.nan
+        tau, pval = stats.kendalltau(x, y)
+        return float(tau), float(pval)
 
     def aggregate_ci_from_samples(self, samples: List[float]) -> Dict[str, float]:
         """
