@@ -62,14 +62,15 @@ cd tabular-synth-calibration
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install numpy pandas torch scikit-learn scipy matplotlib seaborn
-pip install sdv  # Synthetic Data Vault (CTGAN, TVAE)
-pip install optuna  # Hyperparameter optimization
-pip install shap catboost  # Interpretability
-pip install tabpfn  # TabPFN foundation model (optional but recommended)
-pip install synthcity # TabDDPM generative model
-pip install tabpfgen # Implementation of TabPFN as a generator of synthetic samples
+# Install dependencies (default profile: SDV + TabDDPM)
+pip install -r requirements.txt
+
+# Optional: TabPFGen profile (use a separate environment)
+# pip install -r requirements-tabpfgen.txt
+
+# NOTE:
+# TabPFGen and TabDDPM/synthcity currently require incompatible torch versions
+# on Python 3.12, so they should be installed in separate environments.
 ```
 
 ### Basic Usage
