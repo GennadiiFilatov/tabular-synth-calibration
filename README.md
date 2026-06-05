@@ -145,3 +145,17 @@ Where:
 
 
 **Output:** Non-negative weights w for all synthetic samples
+
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@inproceedings{filatov2026when,
+  title={When Synthetic Data Is Enough: Calibration for Tabular Model Ranking},
+  author={Gennadii Filatov and Irina Deeva},
+  booktitle={Towards Trustworthy Predictions: Theory and Applications of Calibration for Modern AI},
+  year={2026},
+  url={https://openreview.net/forum?id=YECegW8nBY}
+}
+```
