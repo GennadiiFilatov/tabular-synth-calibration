@@ -21,7 +21,12 @@ from .generation import SyntheticDataGenerator
 from .models import ModelSelectionFramework, ModelConfig
 from .confidence import ConfidenceIntervalEstimator
 from .metrics import EvaluationMetrics
-from .calibrator import SyntheticDataCalibrator, SyntheticBPRCalibrator
+from .calibrator import (
+    SyntheticDataCalibrator,
+    SyntheticBPRCalibrator,
+    SyntheticDensityCalibration,
+    PPICalibration,
+)
 from .shap_analizer import SHAPWeightsAnalyzer
 from typing import Any, Optional, Union, List, Dict, Tuple, Callable
 
@@ -47,7 +52,20 @@ class ExperimentRunner:
                  bpr_beta: float = 1.0,
                  bpr_lambda_reg: float = 0.5,
                  bpr_mu: float = 0.0,
-                 bpr_tau: float = 1.0):
+                 bpr_tau: float = 1.0,
+                 bpr_rho: float = 0.5,
+                 density_method: str = 'xgboost',
+                 density_xgb_n_estimators: int = 300,
+                 density_xgb_max_depth: int = 6,
+                 density_xgb_learning_rate: float = 0.1,
+                 density_xgb_subsample: float = 1.0,
+                 density_xgb_colsample_bytree: float = 1.0,
+                 density_xgb_reg_lambda: float = 1.0,
+                 density_xgb_reg_alpha: float = 0.0,
+                 density_xgb_tree_method: str = 'hist',
+                 density_xgb_n_jobs: int = -1,
+                 density_random_state: Optional[int] = None
+                 ) -> None:
         """
         Initialize experiment runner.
         
@@ -68,6 +86,18 @@ class ExperimentRunner:
             bpr_lambda_reg: L2 regularization for BPR calibration
             bpr_mu: KL regularization strength for BPR calibration
             bpr_tau: Temperature parameter for BPR calibration
+            bpr_rho: Regularization strength for the centric matrix
+            density_method: Density ratio estimator ('xgboost')
+            density_xgb_n_estimators: XGBoost number of trees
+            density_xgb_max_depth: XGBoost max tree depth
+            density_xgb_learning_rate: XGBoost learning rate
+            density_xgb_subsample: XGBoost subsample ratio
+            density_xgb_colsample_bytree: XGBoost colsample_bytree ratio
+            density_xgb_reg_lambda: XGBoost L2 regularization
+            density_xgb_reg_alpha: XGBoost L1 regularization
+            density_xgb_tree_method: XGBoost tree method
+            density_xgb_n_jobs: XGBoost parallel threads
+            density_random_state: Random state for density classifier
         """
         self.dataset_name = dataset_name
         self.synth_method = synth_method
@@ -81,6 +111,18 @@ class ExperimentRunner:
         self.bpr_lambda_reg = bpr_lambda_reg
         self.bpr_mu = bpr_mu
         self.bpr_tau = bpr_tau
+        self.bpr_rho = bpr_rho
+        self.density_method = density_method
+        self.density_xgb_n_estimators = density_xgb_n_estimators
+        self.density_xgb_max_depth = density_xgb_max_depth
+        self.density_xgb_learning_rate = density_xgb_learning_rate
+        self.density_xgb_subsample = density_xgb_subsample
+        self.density_xgb_colsample_bytree = density_xgb_colsample_bytree
+        self.density_xgb_reg_lambda = density_xgb_reg_lambda
+        self.density_xgb_reg_alpha = density_xgb_reg_alpha
+        self.density_xgb_tree_method = density_xgb_tree_method
+        self.density_xgb_n_jobs = density_xgb_n_jobs
+        self.density_random_state = density_random_state
         # Auto-select loss_type based on task
         if loss_type is None:
             loss_type = 'log_loss' if task_type == 'classification' else 'mae'
@@ -104,6 +146,8 @@ class ExperimentRunner:
         self._synthesizer = None
         self._synth_generator = None
         self._last_bpr_calibrator = None
+        self._last_density_calibrator = None
+        self._last_ppi_calibrator = None
         self._best_hyperparams = None
         self._synth_data_cached = None
         self._figure_counter = 0
@@ -477,6 +521,8 @@ class ExperimentRunner:
             fold_per_sample_real = []
             fold_per_sample_synth = []
             fold_per_sample_calib = []
+
+            weights_for_samples = self.calibrator.compute_weights_for_samples(y_synth)
             
             for config, model in zip(architectures_M_test, trained_m_test_models):
                 real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
@@ -490,7 +536,7 @@ class ExperimentRunner:
 
                 per_sample_real = self.calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
                 per_sample_synth = self.calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * self.calibrator.compute_weights_for_samples(y_synth)
+                per_sample_calib = per_sample_synth * self.calibrator.weights * n_synth
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
@@ -899,7 +945,7 @@ class ExperimentRunner:
 
                 per_sample_real = self.calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
                 per_sample_synth = self.calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * self.calibrator.weights
+                per_sample_calib = per_sample_synth * self.calibrator.weights * n_synth
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
@@ -1001,7 +1047,7 @@ class ExperimentRunner:
         # SHAP analysis
         shap_analyzer = None
         if analyze_shap and self._synth_data_cached is not None:
-            calibration_weights = self.calibrator.weights
+            calibration_weights = self.calibrator.compute_weights_for_samples(y_synth)
             
             if calibration_weights is not None and len(calibration_weights) > 0:
 
@@ -1214,6 +1260,7 @@ class ExperimentRunner:
             lambda_reg=self.bpr_lambda_reg,
             mu=self.bpr_mu,
             tau=self.bpr_tau,
+            rho=self.bpr_rho,
             verbose=self.verbose,
             task_type=self.task_type,
             loss_type=self.loss_type
@@ -1451,7 +1498,7 @@ class ExperimentRunner:
 
                 per_sample_real = bpr_calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
                 per_sample_synth = bpr_calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * fold_weights
+                per_sample_calib = per_sample_synth * fold_weights * n_synth
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
@@ -1462,10 +1509,10 @@ class ExperimentRunner:
             fold_calib_losses = np.array(fold_calib_losses)
 
             # Compute correlations
-            uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_kendall(
+            uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_spearman(
                 fold_real_losses, fold_synth_losses
             )
-            calib_spearman, calib_pvalue = self.ci_estimator.compute_kendall(
+            calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(
                 fold_real_losses, fold_calib_losses
             )
 
@@ -1588,6 +1635,844 @@ class ExperimentRunner:
         }
 
         self._last_bpr_calibrator = bpr_calibrator
+
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print("EXPERIMENT COMPLETE!")
+            print(f"{'='*80}")
+
+        return self.results
+
+    def run_kfold_ppi_calibration_experiment(self,
+                                             n_folds: int = 5,
+                                             M_calibration: int = 10,
+                                             synth_size_multiplier: float = 1.0,
+                                             calib_test_ratio: float = 0.2,
+                                             tune_synthetic: bool = False,
+                                             n_tune_trials: int = 40,
+                                             analyze_shap: bool = False,
+                                             shap_plot_types: List[str] = ["dot"],
+                                             shap_max_display: int = 15,
+                                             ppi_use_annotator: bool = False,
+                                             ppi_annotator_strategy: str = "best_calib",
+                                             ppi_lambda_bounds: Tuple[float, float] = (0.0, 1.0)) -> Dict:
+        """
+        Main experiment pipeline with K-fold cross-validation using PPI++ calibration.
+
+        PPI++ estimates calibrated risk for each evaluation model using:
+        - Synthetic samples (unlabeled proxy)
+        - A small labeled real set
+        - Optional annotator confidence for variance reduction
+        """
+        ppi_calibrator = PPICalibration(
+            task_type=self.task_type,
+            loss_type=self.loss_type,
+            lambda_bounds=ppi_lambda_bounds,
+            verbose=self.verbose,
+        )
+
+        # ============================================================
+        # [1] LOAD RAW DATA
+        # ============================================================
+        if self.verbose:
+            print("\n" + "="*80)
+            print("K-FOLD PPI CALIBRATION EXPERIMENT")
+            print("="*80)
+            print(f"\n[1/6] Loading dataset: {self.dataset_name}...")
+
+        df = self.data_loader.load_uci_dataset(self.dataset_name)
+
+        target_col = None
+        for col in ['income', 'target', 'class']:
+            if col in df.columns:
+                target_col = col
+                break
+        if target_col is None:
+            target_col = df.columns[-1]
+
+        X_full = df.drop(columns=[target_col]).copy()
+        y_full = df[target_col].copy()
+
+        if self.verbose:
+            print(f"   Samples: {len(X_full)}, Features: {X_full.shape[1]}")
+
+        # ============================================================
+        # [2] OPTIONAL: TUNE GAN ON REFERENCE SPLIT
+        # ============================================================
+        if tune_synthetic and self._synthesizer is None:
+            if self.verbose:
+                print(f"\n[2/6] Tuning GAN hyperparameters...")
+
+            if self.task_type == 'classification':
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE, stratify=y_full
+                )
+            else:
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+
+            X_ref_train_proc, _, y_ref_train_proc, _, _ = self.data_loader.prepare_data(
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test, task_type=self.task_type
+            )
+
+            if self.task_type == 'classification':
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE, stratify=y_ref_train_proc
+                )
+            else:
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+
+            ref_generator = SyntheticDataGenerator(method=self.synth_method, task_type=self.task_type)
+            ref_generator.fit(
+                X_train=X_ref_train_proc,
+                y_train=y_ref_train_proc,
+                X_val=X_ref_val_proc,
+                y_val=y_ref_val_proc,
+                tune_hyperparams=True,
+                n_trials=n_tune_trials,
+                quality_metric='swd',
+                verbose=self.verbose
+            )
+
+            self._best_hyperparams = ref_generator.best_hyperparams
+            self._synthesizer = ref_generator.synthesizer
+            self._synth_generator = ref_generator
+
+            if self.verbose:
+                print(f"   Best hyperparameters: {self._best_hyperparams}")
+        else:
+            if self.verbose:
+                print(f"\n[2/6] Skipping GAN tuning")
+
+        # ============================================================
+        # [3] GET ALL MODEL ARCHITECTURES
+        # ============================================================
+        if self.verbose:
+            print(f"\n[3/6] Setting up model architectures...")
+            print(
+                f"   PPI config: annotator={ppi_use_annotator}, strategy={ppi_annotator_strategy}, "
+                f"lambda_bounds={ppi_lambda_bounds}"
+            )
+
+        all_architectures = self.model_selector.get_model_architectures()
+        n_total_models = len(all_architectures)
+
+        if M_calibration >= n_total_models:
+            raise ValueError(f"M_calibration ({M_calibration}) must be < total architectures ({n_total_models})")
+
+        if self.verbose:
+            print(f"   Total: {n_total_models}, M_train: {M_calibration}, M_test: {n_total_models - M_calibration}")
+
+        # ============================================================
+        # [4] SETUP K-FOLD CROSS-VALIDATION
+        # ============================================================
+        if self.verbose:
+            print(f"\n[4/6] Setting up {n_folds}-fold cross-validation...")
+
+        if self.task_type == 'classification':
+            kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full, y_full)
+        else:
+            kfold = KFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full)
+
+        fold_results = []
+        all_uncalibrated_spearmans = []
+        all_calibrated_spearmans = []
+
+        # ============================================================
+        # [5] RUN EXPERIMENT FOR EACH FOLD
+        # ============================================================
+        if self.verbose:
+            print(f"\n[5/6] Running {n_folds}-fold experiment...")
+
+        for fold_idx, (train_index, test_index) in enumerate(fold_iterator):
+            if self.verbose:
+                print(f"\n{'='*70}")
+                print(f"FOLD {fold_idx + 1}/{n_folds}")
+                print(f"{'='*70}")
+
+            # Split data
+            X_train_fold = X_full.iloc[train_index].reset_index(drop=True)
+            y_train_fold = y_full.iloc[train_index].reset_index(drop=True)
+            X_test_fold = X_full.iloc[test_index].reset_index(drop=True)
+            y_test_fold = y_full.iloc[test_index].reset_index(drop=True)
+
+            X_train_fold_proc, X_test_proc, y_train_fold_proc, y_test_proc, _ = self.data_loader.prepare_data(
+                X_train_fold, X_test_fold, y_train_fold, y_test_fold, task_type=self.task_type
+            )
+
+            if self.verbose:
+                print(f"   D_train size: {len(X_train_fold_proc)}")
+                print(f"   D_test size: {len(X_test_proc)}")
+
+            # Split for calibration
+            if self.task_type == 'classification':
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc,
+                    test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx,
+                    stratify=y_train_fold_proc
+                )
+            else:
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc,
+                    test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx
+                )
+
+            # Split architectures
+            rng = np.random.RandomState(CV_RANDOM_STATE + fold_idx)
+            shuffled_architectures = all_architectures.copy()
+            rng.shuffle(shuffled_architectures)
+
+            architectures_M_train = shuffled_architectures[:M_calibration]
+            architectures_M_test = shuffled_architectures[M_calibration:]
+
+            m_train_names = [a.name for a in architectures_M_train]
+            m_test_names = [a.name for a in architectures_M_test]
+
+            if self.verbose:
+                print(f"   M_train models: {m_train_names[:3]}... ({len(m_train_names)} total)")
+                print(f"   M_test models: {m_test_names[:3]}... ({len(m_test_names)} total)")
+
+            # Train generative model
+            if self.verbose:
+                print(f"   Training {self.synth_method}...")
+
+            fold_generator = self._train_generative_model_for_fold(
+                X_train_fold_proc, y_train_fold_proc,
+                use_cached_hyperparams=(self._best_hyperparams is not None)
+            )
+
+            # Generate synthetic data
+            n_synth = int(len(X_test_proc) * synth_size_multiplier)
+            X_synth, y_synth = fold_generator.generate(n_samples=n_synth)
+
+            if self.task_type == 'classification':
+                y_synth = y_synth.astype(int)
+            else:
+                y_synth = y_synth.astype(float)
+
+            # Train M_train models if annotator is needed
+            trained_m_train_models = []
+            if ppi_use_annotator:
+                for config in architectures_M_train:
+                    model = self.model_selector.train_model(config, X_train_calib, y_train_calib)
+                    trained_m_train_models.append(model)
+
+            annotator_model = None
+            if ppi_use_annotator and self.task_type == 'classification':
+                if ppi_annotator_strategy not in {"best_calib", "first"}:
+                    raise ValueError(
+                        "ppi_annotator_strategy must be 'best_calib' or 'first' for classification."
+                    )
+
+                if ppi_annotator_strategy == "first":
+                    for model in trained_m_train_models:
+                        if hasattr(model, "predict_proba"):
+                            annotator_model = model
+                            break
+                else:
+                    best_loss = np.inf
+                    for model in trained_m_train_models:
+                        if not hasattr(model, "predict_proba"):
+                            continue
+                        eval_result = self.model_selector.evaluate_model(model, X_test_calib, y_test_calib)
+                        if eval_result["loss"] < best_loss:
+                            best_loss = eval_result["loss"]
+                            annotator_model = model
+
+                if annotator_model is None and self.verbose:
+                    print("   PPI annotator not available; falling back to loss-based E_hat.")
+            elif ppi_use_annotator and self.verbose:
+                print("   PPI annotator only supported for classification; ignoring.")
+
+            # Train M_test models
+            trained_m_test_models = []
+            for config in architectures_M_test:
+                model = self.model_selector.train_model(config, X_train_fold_proc, y_train_fold_proc)
+                trained_m_test_models.append(model)
+
+            # Compute losses
+            fold_real_losses = []
+            fold_synth_losses = []
+            fold_calib_losses = []
+            fold_model_names = []
+            fold_ppi_lambdas = []
+
+            fold_per_sample_real = []
+            fold_per_sample_synth = []
+            fold_per_sample_calib = []
+
+            for config, model in zip(architectures_M_test, trained_m_test_models):
+                real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
+                synth_eval = self.model_selector.evaluate_model(model, X_synth, y_synth)
+                calib_loss = ppi_calibrator.evaluate_calibrated_loss(
+                    model,
+                    X_synth,
+                    y_synth,
+                    X_test_calib,
+                    y_test_calib,
+                    annotator_model=annotator_model,
+                )
+
+                fold_real_losses.append(real_eval['loss'])
+                fold_synth_losses.append(synth_eval['loss'])
+                fold_calib_losses.append(calib_loss)
+                fold_model_names.append(config.name)
+                fold_ppi_lambdas.append(ppi_calibrator.last_lambda)
+
+                per_sample_real = ppi_calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
+                per_sample_synth = ppi_calibrator._compute_sample_losses(model, X_synth, y_synth)
+
+                fold_per_sample_real.append(per_sample_real)
+                fold_per_sample_synth.append(per_sample_synth)
+                fold_per_sample_calib.append(None)
+
+            fold_real_losses = np.array(fold_real_losses)
+            fold_synth_losses = np.array(fold_synth_losses)
+            fold_calib_losses = np.array(fold_calib_losses)
+
+            # Compute correlations
+            uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_spearman(
+                fold_real_losses, fold_synth_losses
+            )
+            calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(
+                fold_real_losses, fold_calib_losses
+            )
+
+            all_uncalibrated_spearmans.append(uncalib_spearman)
+            all_calibrated_spearmans.append(calib_spearman)
+
+            # Rank preservation analysis
+            rank_analysis_uncalib = self.metrics.compute_rank_preservation_with_guarantees(
+                fold_real_losses, fold_synth_losses
+            )
+            rank_analysis_calib = self.metrics.compute_rank_preservation_with_guarantees(
+                fold_real_losses, fold_calib_losses
+            )
+
+            # Store fold results
+            fold_result = {
+                'fold': fold_idx + 1,
+                'n_train_calib': len(X_train_calib),
+                'n_test_calib': len(X_test_calib),
+                'n_test': len(X_test_proc),
+                'n_synth': n_synth,
+                'm_train_architectures': m_train_names,
+                'm_test_architectures': m_test_names,
+                'real_losses': fold_real_losses,
+                'synth_losses': fold_synth_losses,
+                'calibrated_synth_losses': fold_calib_losses,
+                'uncalibrated_spearman': uncalib_spearman,
+                'uncalibrated_pvalue': uncalib_pvalue,
+                'calibrated_spearman': calib_spearman,
+                'calibrated_pvalue': calib_pvalue,
+                'rank_analysis_uncalibrated': rank_analysis_uncalib,
+                'rank_analysis_calibrated': rank_analysis_calib,
+                'model_names': fold_model_names,
+                'per_sample_real_losses': fold_per_sample_real,
+                'per_sample_synth_losses': fold_per_sample_synth,
+                'per_sample_calibrated_losses': fold_per_sample_calib,
+                'weights': None,
+                'ppi_lambdas': fold_ppi_lambdas,
+            }
+            fold_results.append(fold_result)
+
+            if self.verbose:
+                print(f"\n   Uncalibrated ρ: {uncalib_spearman:.3f}")
+                print(f"   Calibrated ρ:   {calib_spearman:.3f} ({calib_spearman - uncalib_spearman:+.3f})")
+
+        # ============================================================
+        # [6] AGGREGATE RESULTS
+        # ============================================================
+        if self.verbose:
+            print(f"\n[6/6] Computing aggregate statistics...")
+
+        uncalib_stats = self.ci_estimator.aggregate_ci_from_samples(all_uncalibrated_spearmans)
+        calib_stats = self.ci_estimator.aggregate_ci_from_samples(all_calibrated_spearmans)
+
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print(f"AGGREGATE RESULTS ({n_folds} folds)")
+            print(f"{'='*80}")
+            print(f"Uncalibrated: {uncalib_stats['mean']:.3f} ± {uncalib_stats['std']:.3f}")
+            print(f"  95% CI: [{uncalib_stats['ci_lower']:.3f}, {uncalib_stats['ci_upper']:.3f}]")
+            print(f"Calibrated:   {calib_stats['mean']:.3f} ± {calib_stats['std']:.3f}")
+            print(f"  95% CI: [{calib_stats['ci_lower']:.3f}, {calib_stats['ci_upper']:.3f}]")
+
+        # Cache data
+        self.xreal = X_test_proc
+        self.yreal = y_test_proc
+        self.xsynth = X_synth
+        self.ysynth = y_synth
+        self._synth_data_cached = (X_synth, y_synth)
+
+        if self._synthesizer is None and fold_generator is not None:
+            if hasattr(fold_generator, 'synthesizer') and fold_generator.synthesizer is not None:
+                self._synthesizer = fold_generator.synthesizer
+            elif hasattr(fold_generator, '_tabpfgen') and fold_generator._tabpfgen is not None:
+                self._synthesizer = fold_generator
+            elif hasattr(fold_generator, '_tabddpm_plugin') and fold_generator._tabddpm_plugin is not None:
+                self._synthesizer = fold_generator
+            else:
+                self._synthesizer = fold_generator
+            self._synth_generator = fold_generator
+
+        shap_analyzer = None
+        if analyze_shap and self.verbose:
+            print("PPI calibration does not produce sample weights; SHAP analysis is skipped.")
+
+        # Store results
+        self.results = {
+            'dataset': self.dataset_name,
+            'synth_method': self.synth_method,
+            'task_type': self.task_type,
+            'n_folds': n_folds,
+            'M_calibration': M_calibration,
+            'n_evaluation_models': n_total_models - M_calibration,
+            'fold_results': fold_results,
+            'iteration_results': fold_results,  # Backward compatibility
+            'uncalibrated_stats': uncalib_stats,
+            'calibrated_stats': calib_stats,
+            'uncalibrated_spearmans': all_uncalibrated_spearmans,
+            'calibrated_spearmans': all_calibrated_spearmans,
+            'shap_analyzer': shap_analyzer,
+        }
+
+        self._last_ppi_calibrator = ppi_calibrator
+
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print("EXPERIMENT COMPLETE!")
+            print(f"{'='*80}")
+
+        return self.results
+
+    def run_kfold_density_calibration_experiment(self,
+                                                 n_folds: int = 5,
+                                                 M_calibration: int = 10,
+                                                 synth_size_multiplier: float = 1.0,
+                                                 calib_test_ratio: float = 0.2,
+                                                 tune_synthetic: bool = False,
+                                                 n_tune_trials: int = 40,
+                                                 analyze_shap: bool = True,
+                                                 shap_plot_types: List[str] = ["dot"],
+                                                 shap_max_display: int = 15) -> Dict:
+        """
+        Main experiment pipeline with K-fold cross-validation using density calibration.
+
+        Pipeline for each fold:
+
+        1. Split data: D_train (fold train), D_test (fold test)
+        2. Further split D_train -> D_train_calib, D_test_calib
+        3. Fit preprocessing on D_train_calib, apply to D_test_calib and D_test
+        4. Train generative model on D_train_calib (fixed hyperparams)
+        5. Split all architectures -> M_train (calibration), M_test (evaluation)
+        6. Generate D_synth_test (size = len(D_test))
+        7. Estimate density-ratio weights using D_test_calib vs D_synth_test
+        8. For M_test: compute losses on D_test, D_synth (uncalibrated), D_synth (calibrated)
+        9. Compute Spearman correlation for uncalibrated and calibrated rankings
+
+        Args:
+            n_folds: Number of cross-validation folds
+            M_calibration: Number of models reserved for calibration (not used by density ratio)
+            synth_size_multiplier: Multiplier for synthetic data size
+            calib_test_ratio: Ratio of train data for calibration test
+            tune_synthetic: Whether to tune GAN hyperparameters
+            n_tune_trials: Number of Optuna trials for tuning
+            analyze_shap: Whether to perform SHAP analysis
+            shap_plot_types: SHAP plot types
+            shap_max_display: Max features for SHAP plots
+
+        Returns:
+            Dictionary with comprehensive experiment results
+        """
+
+        # ============================================================
+        # [1] LOAD RAW DATA
+        # ============================================================
+        if self.verbose:
+            print("\n" + "="*80)
+            print("K-FOLD DENSITY CALIBRATION EXPERIMENT")
+            print("="*80)
+            print(f"\n[1/6] Loading dataset: {self.dataset_name}...")
+
+        df = self.data_loader.load_uci_dataset(self.dataset_name)
+
+        target_col = None
+        for col in ['income', 'target', 'class']:
+            if col in df.columns:
+                target_col = col
+                break
+        if target_col is None:
+            target_col = df.columns[-1]
+
+        X_full = df.drop(columns=[target_col]).copy()
+        y_full = df[target_col].copy()
+
+        if self.verbose:
+            print(f"   Samples: {len(X_full)}, Features: {X_full.shape[1]}")
+
+        # ============================================================
+        # [2] OPTIONAL: TUNE GAN ON REFERENCE SPLIT
+        # ============================================================
+        if tune_synthetic and self._synthesizer is None:
+            if self.verbose:
+                print(f"\n[2/6] Tuning GAN hyperparameters...")
+
+            if self.task_type == 'classification':
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE, stratify=y_full
+                )
+            else:
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+
+            X_ref_train_proc, _, y_ref_train_proc, _, _ = self.data_loader.prepare_data(
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test, task_type=self.task_type
+            )
+
+            if self.task_type == 'classification':
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE, stratify=y_ref_train_proc
+                )
+            else:
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+
+            ref_generator = SyntheticDataGenerator(method=self.synth_method, task_type=self.task_type)
+            ref_generator.fit(
+                X_train=X_ref_train_proc,
+                y_train=y_ref_train_proc,
+                X_val=X_ref_val_proc,
+                y_val=y_ref_val_proc,
+                tune_hyperparams=True,
+                n_trials=n_tune_trials,
+                quality_metric='swd',
+                verbose=self.verbose
+            )
+
+            self._best_hyperparams = ref_generator.best_hyperparams
+            self._synthesizer = ref_generator.synthesizer
+            self._synth_generator = ref_generator
+
+            if self.verbose:
+                print(f"   Best hyperparameters: {self._best_hyperparams}")
+        else:
+            if self.verbose:
+                print(f"\n[2/6] Skipping GAN tuning")
+
+        # ============================================================
+        # [3] GET ALL MODEL ARCHITECTURES
+        # ============================================================
+        if self.verbose:
+            print(f"\n[3/6] Setting up model architectures...")
+            print(
+                f"   Density config: method={self.density_method}, "
+                f"n_estimators={self.density_xgb_n_estimators}, "
+                f"max_depth={self.density_xgb_max_depth}, "
+                f"learning_rate={self.density_xgb_learning_rate}"
+            )
+
+        all_architectures = self.model_selector.get_model_architectures()
+        n_total_models = len(all_architectures)
+
+        if M_calibration >= n_total_models:
+            raise ValueError(f"M_calibration ({M_calibration}) must be < total architectures ({n_total_models})")
+
+        if self.verbose:
+            print(f"   Total: {n_total_models}, M_train: {M_calibration}, M_test: {n_total_models - M_calibration}")
+
+        # ============================================================
+        # [4] SETUP K-FOLD CROSS-VALIDATION
+        # ============================================================
+        if self.verbose:
+            print(f"\n[4/6] Setting up {n_folds}-fold cross-validation...")
+
+        if self.task_type == 'classification':
+            kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full, y_full)
+        else:
+            kfold = KFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full)
+
+        fold_results = []
+        all_uncalibrated_spearmans = []
+        all_calibrated_spearmans = []
+
+        # ============================================================
+        # [5] RUN EXPERIMENT FOR EACH FOLD
+        # ============================================================
+        if self.verbose:
+            print(f"\n[5/6] Running {n_folds}-fold experiment...")
+
+        for fold_idx, (train_index, test_index) in enumerate(fold_iterator):
+            if self.verbose:
+                print(f"\n{'='*70}")
+                print(f"FOLD {fold_idx + 1}/{n_folds}")
+                print(f"{'='*70}")
+            
+            density_calibrator = SyntheticDensityCalibration(
+            method=self.density_method,
+            xgb_n_estimators=self.density_xgb_n_estimators,
+            xgb_max_depth=self.density_xgb_max_depth,
+            xgb_learning_rate=self.density_xgb_learning_rate,
+            xgb_subsample=self.density_xgb_subsample,
+            xgb_colsample_bytree=self.density_xgb_colsample_bytree,
+            xgb_reg_lambda=self.density_xgb_reg_lambda,
+            xgb_reg_alpha=self.density_xgb_reg_alpha,
+            xgb_tree_method=self.density_xgb_tree_method,
+            xgb_n_jobs=self.density_xgb_n_jobs,
+            random_state=self.density_random_state,
+            verbose=self.verbose,
+            task_type=self.task_type,
+            loss_type=self.loss_type
+        )
+
+            # Split data
+            X_train_fold = X_full.iloc[train_index].reset_index(drop=True)
+            y_train_fold = y_full.iloc[train_index].reset_index(drop=True)
+            X_test_fold = X_full.iloc[test_index].reset_index(drop=True)
+            y_test_fold = y_full.iloc[test_index].reset_index(drop=True)
+
+            X_train_fold_proc, X_test_proc, y_train_fold_proc, y_test_proc, _ = self.data_loader.prepare_data(
+                X_train_fold, X_test_fold, y_train_fold, y_test_fold, task_type=self.task_type
+            )
+
+            if self.verbose:
+                print(f"   D_train size: {len(X_train_fold_proc)}")
+                print(f"   D_test size: {len(X_test_proc)}")
+
+            # Split for calibration
+            if self.task_type == 'classification':
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc,
+                    test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx,
+                    stratify=y_train_fold_proc
+                )
+            else:
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc,
+                    test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx
+                )
+
+            # Split architectures
+            rng = np.random.RandomState(CV_RANDOM_STATE + fold_idx)
+            shuffled_architectures = all_architectures.copy()
+            rng.shuffle(shuffled_architectures)
+
+            architectures_M_train = shuffled_architectures[:M_calibration]
+            architectures_M_test = shuffled_architectures[M_calibration:]
+
+            m_train_names = [a.name for a in architectures_M_train]
+            m_test_names = [a.name for a in architectures_M_test]
+
+            if self.verbose:
+                print(f"   M_train models: {m_train_names[:3]}... ({len(m_train_names)} total)")
+                print(f"   M_test models: {m_test_names[:3]}... ({len(m_test_names)} total)")
+
+            # Train generative model
+            if self.verbose:
+                print(f"   Training {self.synth_method}...")
+
+            fold_generator = self._train_generative_model_for_fold(
+                X_train_fold_proc, y_train_fold_proc,
+                use_cached_hyperparams=(self._best_hyperparams is not None)
+            )
+
+            # Generate synthetic data
+            n_synth = int(len(X_test_proc) * synth_size_multiplier)
+            X_synth, y_synth = fold_generator.generate(n_samples=n_synth)
+            X_synth_calib, y_synth_calib = fold_generator.generate(n_samples=n_synth)
+
+            if self.task_type == 'classification':
+                y_synth = y_synth.astype(int)
+            else:
+                y_synth = y_synth.astype(float)
+
+            # Fit density calibrator
+            density_calibrator.fit(
+                X_real=X_test_calib,
+                X_synth=X_synth_calib
+            )
+            fold_weights = density_calibrator.compute_weights_for_samples()
+
+            # Train M_test models
+            trained_m_test_models = []
+            for config in architectures_M_test:
+                model = self.model_selector.train_model(config, X_train_fold_proc, y_train_fold_proc)
+                trained_m_test_models.append(model)
+
+            # Compute losses
+            fold_real_losses = []
+            fold_synth_losses = []
+            fold_calib_losses = []
+            fold_model_names = []
+
+            fold_per_sample_real = []
+            fold_per_sample_synth = []
+            fold_per_sample_calib = []
+
+            for config, model in zip(architectures_M_test, trained_m_test_models):
+                real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
+                synth_eval = self.model_selector.evaluate_model(model, X_synth, y_synth)
+                calib_loss = density_calibrator.evaluate_calibrated_loss(model, X_synth, y_synth)
+
+                fold_real_losses.append(real_eval['loss'])
+                fold_synth_losses.append(synth_eval['loss'])
+                fold_calib_losses.append(calib_loss)
+                fold_model_names.append(config.name)
+
+                per_sample_real = density_calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
+                per_sample_synth = density_calibrator._compute_sample_losses(model, X_synth, y_synth)
+                per_sample_calib = per_sample_synth * fold_weights * n_synth
+
+                fold_per_sample_real.append(per_sample_real)
+                fold_per_sample_synth.append(per_sample_synth)
+                fold_per_sample_calib.append(per_sample_calib)
+
+            fold_real_losses = np.array(fold_real_losses)
+            fold_synth_losses = np.array(fold_synth_losses)
+            fold_calib_losses = np.array(fold_calib_losses)
+
+            # Compute correlations
+            uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_spearman(
+                fold_real_losses, fold_synth_losses
+            )
+            calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(
+                fold_real_losses, fold_calib_losses
+            )
+
+            all_uncalibrated_spearmans.append(uncalib_spearman)
+            all_calibrated_spearmans.append(calib_spearman)
+
+            # Rank preservation analysis
+            rank_analysis_uncalib = self.metrics.compute_rank_preservation_with_guarantees(
+                fold_real_losses, fold_synth_losses
+            )
+            rank_analysis_calib = self.metrics.compute_rank_preservation_with_guarantees(
+                fold_real_losses, fold_calib_losses
+            )
+
+            # Store fold results
+            fold_result = {
+                'fold': fold_idx + 1,
+                'n_train_calib': len(X_train_calib),
+                'n_test_calib': len(X_test_calib),
+                'n_test': len(X_test_proc),
+                'n_synth': n_synth,
+                'm_train_architectures': m_train_names,
+                'm_test_architectures': m_test_names,
+                'real_losses': fold_real_losses,
+                'synth_losses': fold_synth_losses,
+                'calibrated_synth_losses': fold_calib_losses,
+                'uncalibrated_spearman': uncalib_spearman,
+                'uncalibrated_pvalue': uncalib_pvalue,
+                'calibrated_spearman': calib_spearman,
+                'calibrated_pvalue': calib_pvalue,
+                'rank_analysis_uncalibrated': rank_analysis_uncalib,
+                'rank_analysis_calibrated': rank_analysis_calib,
+                'model_names': fold_model_names,
+                'per_sample_real_losses': fold_per_sample_real,
+                'per_sample_synth_losses': fold_per_sample_synth,
+                'per_sample_calibrated_losses': fold_per_sample_calib,
+                'weights': fold_weights
+            }
+            fold_results.append(fold_result)
+
+            if self.verbose:
+                print(f"\n   Uncalibrated ρ: {uncalib_spearman:.3f}")
+                print(f"   Calibrated ρ:   {calib_spearman:.3f} ({calib_spearman - uncalib_spearman:+.3f})")
+
+        # ============================================================
+        # [6] AGGREGATE RESULTS
+        # ============================================================
+        if self.verbose:
+            print(f"\n[6/6] Computing aggregate statistics...")
+
+        uncalib_stats = self.ci_estimator.aggregate_ci_from_samples(all_uncalibrated_spearmans)
+        calib_stats = self.ci_estimator.aggregate_ci_from_samples(all_calibrated_spearmans)
+
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print(f"AGGREGATE RESULTS ({n_folds} folds)")
+            print(f"{'='*80}")
+            print(f"Uncalibrated: {uncalib_stats['mean']:.3f} ± {uncalib_stats['std']:.3f}")
+            print(f"  95% CI: [{uncalib_stats['ci_lower']:.3f}, {uncalib_stats['ci_upper']:.3f}]")
+            print(f"Calibrated:   {calib_stats['mean']:.3f} ± {calib_stats['std']:.3f}")
+            print(f"  95% CI: [{calib_stats['ci_lower']:.3f}, {calib_stats['ci_upper']:.3f}]")
+
+        # Cache data
+        self.xreal = X_test_proc
+        self.yreal = y_test_proc
+        self.xsynth = X_synth
+        self.ysynth = y_synth
+        self._synth_data_cached = (X_synth, y_synth)
+
+        if self._synthesizer is None and fold_generator is not None:
+            # Store the underlying synthesizer for SDK methods (CTGAN, TVAE, GaussianCopula)
+            if hasattr(fold_generator, 'synthesizer') and fold_generator.synthesizer is not None:
+                self._synthesizer = fold_generator.synthesizer
+            # For TabPFGen, store the generator itself
+            elif hasattr(fold_generator, '_tabpfgen') and fold_generator._tabpfgen is not None:
+                self._synthesizer = fold_generator
+            # For TabDDPM, store the plugin
+            elif hasattr(fold_generator, '_tabddpm_plugin') and fold_generator._tabddpm_plugin is not None:
+                self._synthesizer = fold_generator
+            else:
+                # Fallback: store the whole generator
+                self._synthesizer = fold_generator
+            self._synth_generator = fold_generator
+
+        # SHAP analysis
+        shap_analyzer = None
+        if analyze_shap and self._synth_data_cached is not None:
+            calibration_weights = density_calibrator.compute_weights_for_samples()
+
+            if calibration_weights is not None and len(calibration_weights) > 0:
+
+                y_real_values = y_test_proc.values if hasattr(y_test_proc, 'values') else np.array(y_test_proc)
+
+                shap_analyzer = self.analyze_calibration_weights_with_shap(
+                    X_synth=X_synth,
+                    y_synth=y_synth,
+                    calibration_weights=calibration_weights,
+                    X_real=X_test_proc,
+                    y_real=y_real_values,
+                    plot_types=shap_plot_types,
+                    max_display=shap_max_display,
+                    verbose=self.verbose
+                )
+
+        # Store results
+        self.results = {
+            'dataset': self.dataset_name,
+            'synth_method': self.synth_method,
+            'task_type': self.task_type,
+            'n_folds': n_folds,
+            'M_calibration': M_calibration,
+            'n_evaluation_models': n_total_models - M_calibration,
+            'fold_results': fold_results,
+            'iteration_results': fold_results,  # Backward compatibility
+            'uncalibrated_stats': uncalib_stats,
+            'calibrated_stats': calib_stats,
+            'uncalibrated_spearmans': all_uncalibrated_spearmans,
+            'calibrated_spearmans': all_calibrated_spearmans,
+            'shap_analyzer': shap_analyzer
+        }
+
+        self._last_density_calibrator = density_calibrator
 
         if self.verbose:
             print(f"\n{'='*80}")
@@ -1880,7 +2765,7 @@ class ExperimentRunner:
 
                 per_sample_real = self.calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
                 per_sample_synth = self.calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * self.calibrator.weights
+                per_sample_calib = per_sample_synth * self.calibrator.weights * n_synth
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
@@ -1982,7 +2867,7 @@ class ExperimentRunner:
         # SHAP analysis
         shap_analyzer = None
         if analyze_shap and self._synth_data_cached is not None:
-            calibration_weights = self.calibrator.weights
+            calibration_weights = self.calibrator.compute_weights_for_samples(y_synth)
             
             if calibration_weights is not None and len(calibration_weights) > 0:
 
@@ -2382,7 +3267,7 @@ class ExperimentRunner:
 
                 per_sample_real = self.calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
                 per_sample_synth = self.calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * self.calibrator.weights
+                per_sample_calib = per_sample_synth * self.calibrator.weights * n_synth
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
@@ -2484,7 +3369,7 @@ class ExperimentRunner:
         # SHAP analysis
         shap_analyzer = None
         if analyze_shap and self._synth_data_cached is not None:
-            calibration_weights = self.calibrator.weights
+            calibration_weights = self.calibrator.compute_weights_for_samples(y_synth)
             
             if calibration_weights is not None and len(calibration_weights) > 0:
 
@@ -2525,13 +3410,24 @@ class ExperimentRunner:
         
         return self.results
 
-    def visualize_correlation_results(self, figsize: Tuple[int, int] = (16, 12)):
+    def visualize_correlation_results(self,
+                                      figsize: Tuple[int, int] = (16, 12),
+                                      topk_list: Optional[List[int]] = None,
+                                      topk_focus_k: int = 5,
+                                      plot_topk_metrics: bool = True):
         """
         Visualize correlation results with per-fold scatter plots.
         
         Creates:
         1. Correlation comparison bar chart (uncalibrated vs calibrated)
-        2. Individual scatter plots for each fold (real vs synthetic losses)
+        2. Top-k ranking metrics bar chart (Spearman@k, NDCG@k, Hit-Rate@k)
+        3. Individual scatter plots for each fold (real vs synthetic losses)
+
+        Args:
+            figsize: Base figure size used for top-k metrics chart
+            topk_list: List of k values to evaluate (default: [1, 3, 5, 10])
+            topk_focus_k: Focus k for the top-k bar chart
+            plot_topk_metrics: Whether to plot top-k ranking metrics
         """
         if not self.results:
             print("No results to visualize. Run run_kfold_calibration_experiment first.")
@@ -2590,6 +3486,54 @@ class ExperimentRunner:
         plt.tight_layout()
         self._save_figure(fig1, 'correlation_comparison')
         plt.show()
+
+        topk_metrics = self.compute_topk_metrics(topk_list=topk_list, topk_focus_k=topk_focus_k)
+        if plot_topk_metrics and topk_metrics is not None:
+            focus_k = topk_metrics['focus_k']
+            metrics_order = ['spearman', 'ndcg', 'hit_rate']
+            metric_labels = [
+                f'Spearman@{focus_k}',
+                f'NDCG@{focus_k}',
+                f'Hit-Rate@{focus_k}'
+            ]
+
+            uncalib_means = []
+            uncalib_stds = []
+            calib_means = []
+            calib_stds = []
+            for metric in metrics_order:
+                summary = topk_metrics['summary'][(focus_k, metric)]
+                uncalib_means.append(summary['uncalibrated_mean'])
+                uncalib_stds.append(summary['uncalibrated_std'])
+                calib_means.append(summary['calibrated_mean'])
+                calib_stds.append(summary['calibrated_std'])
+
+            all_means = np.asarray(uncalib_means + calib_means, dtype=float)
+            if not np.all(np.isnan(all_means)):
+                fig3, ax3 = plt.subplots(figsize=(figsize[0] * 0.6, figsize[1] * 0.4))
+                x = np.arange(len(metric_labels))
+                width = 0.35
+
+                ax3.bar(x - width / 2, uncalib_means, width, yerr=uncalib_stds,
+                        color='coral', alpha=0.7, edgecolor='black',
+                        linewidth=1.5, capsize=6, label='Uncalibrated')
+                ax3.bar(x + width / 2, calib_means, width, yerr=calib_stds,
+                        color='lightgreen', alpha=0.7, edgecolor='black',
+                        linewidth=1.5, capsize=6, label='Calibrated')
+
+                ax3.set_xticks(x)
+                ax3.set_xticklabels(metric_labels)
+                ax3.set_ylabel('Score', fontsize=12)
+                ax3.set_title(
+                    f'Top-k Ranking Metrics (k={focus_k})\nTop-k based on real losses',
+                    fontsize=13, fontweight='bold'
+                )
+                ax3.axhline(0, color='black', linewidth=0.8, alpha=0.6)
+                ax3.grid(True, alpha=0.3, axis='y')
+                ax3.legend()
+                plt.tight_layout()
+                self._save_figure(fig3, f'topk_metrics_k{focus_k}')
+                plt.show()
         
         # Figure 2: Per-fold scatter plots
         n_cols = min(5, n_iterations)
@@ -2655,6 +3599,93 @@ class ExperimentRunner:
         self._save_figure(fig2, 'per_fold_scatter')
         plt.show()
 
+        return topk_metrics
+
+    def compute_topk_metrics(self,
+                             topk_list: Optional[List[int]] = None,
+                             topk_focus_k: int = 5) -> Optional[Dict[str, Any]]:
+        """
+        Compute top-k ranking metrics without plotting.
+
+        Returns a dictionary with per-fold metrics, aggregated summary, and focus k.
+        """
+        if not self.results:
+            print("No results to compute. Run run_kfold_calibration_experiment first.")
+            return None
+
+        iteration_results = self.results.get('fold_results', self.results.get('iteration_results', []))
+        if topk_list is None:
+            topk_list = [1, 3, 5, 10]
+        if topk_focus_k not in topk_list:
+            topk_list = sorted(set(topk_list + [topk_focus_k]))
+
+        topk_summary = {}
+        for k in topk_list:
+            topk_summary[k] = {
+                'uncalib': {'spearman': [], 'ndcg': [], 'hit_rate': []},
+                'calib': {'spearman': [], 'ndcg': [], 'hit_rate': []}
+            }
+
+        min_models = None
+        for iter_result in iteration_results:
+            real_losses = np.asarray(iter_result['real_losses'], dtype=float)
+            synth_losses = np.asarray(iter_result['synth_losses'], dtype=float)
+            calibrated_losses = np.asarray(iter_result['calibrated_synth_losses'], dtype=float)
+
+            n_models = len(real_losses)
+            if min_models is None or n_models < min_models:
+                min_models = n_models
+
+            for k in topk_list:
+                uncalib_metrics = self.metrics.topk_metrics(real_losses, synth_losses, k)
+                calib_metrics = self.metrics.topk_metrics(real_losses, calibrated_losses, k)
+
+                topk_summary[k]['uncalib']['spearman'].append(uncalib_metrics['spearman'])
+                topk_summary[k]['uncalib']['ndcg'].append(uncalib_metrics['ndcg'])
+                topk_summary[k]['uncalib']['hit_rate'].append(uncalib_metrics['hit_rate'])
+
+                topk_summary[k]['calib']['spearman'].append(calib_metrics['spearman'])
+                topk_summary[k]['calib']['ndcg'].append(calib_metrics['ndcg'])
+                topk_summary[k]['calib']['hit_rate'].append(calib_metrics['hit_rate'])
+
+        if min_models is None or min_models == 0:
+            print("No per-fold losses available for top-k metrics.")
+            return None
+
+        def _aggregate(values: List[float]) -> Tuple[float, float]:
+            vals = np.asarray(values, dtype=float)
+            vals = vals[~np.isnan(vals)]
+            if len(vals) == 0:
+                return np.nan, np.nan
+            std = np.std(vals, ddof=1) if len(vals) > 1 else 0.0
+            return float(np.mean(vals)), float(std)
+
+        summary = {}
+        for k in topk_list:
+            for metric in ['spearman', 'ndcg', 'hit_rate']:
+                mean_u, std_u = _aggregate(topk_summary[k]['uncalib'][metric])
+                mean_c, std_c = _aggregate(topk_summary[k]['calib'][metric])
+                summary[(k, metric)] = {
+                    'uncalibrated_mean': mean_u,
+                    'uncalibrated_std': std_u,
+                    'calibrated_mean': mean_c,
+                    'calibrated_std': std_c,
+                    'n_folds': len(topk_summary[k]['uncalib'][metric])
+                }
+
+        focus_k = min(topk_focus_k, min_models)
+        if focus_k not in topk_summary:
+            focus_k = topk_list[0]
+
+        result = {
+            'k_list': topk_list,
+            'per_fold': topk_summary,
+            'summary': summary,
+            'focus_k': focus_k
+        }
+        self.results['topk_metrics'] = result
+        return result
+
     def compare_vectors(self,
                         iteration: int = 1,
                         model_idx: int = 0,
@@ -2701,6 +3732,10 @@ class ExperimentRunner:
         
         # Get weights from calibrator
         weights = iter_result['weights']
+
+        if weights is None:
+            print("Sample weights are not available for this experiment.")
+            return
         
         # Get cached data
         if self._synth_data_cached is None:
@@ -2916,8 +3951,8 @@ class ExperimentRunner:
         model_names = iter_result['model_names']
         per_sample_real = iter_result['per_sample_real_losses']
         per_sample_synth = iter_result['per_sample_synth_losses']
-        calibrated_losses = iter_result['calibrated_synth_losses']
-        
+        calibrated_losses = iter_result['per_sample_calibrated_losses'] * len(per_sample_synth)
+
         n_models = len(model_names)
         n_cols = min(models_per_row, n_models)
         n_rows = (n_models + n_cols - 1) // n_cols
@@ -2952,11 +3987,13 @@ class ExperimentRunner:
                    range=x_range, density=True, label=f'Real (μ={np.mean(real_losses):.3f})')
             ax.hist(synth_losses, bins=bins, color='coral', alpha=0.5,
                    range=x_range, density=True, label=f'Synth (μ={np.mean(synth_losses):.3f})')
+            ax.hist(calib_loss, bins=bins, color='lightgreen', alpha=0.5,
+                   range=x_range, density=True, label=f'Calib (μ={np.mean(calib_loss):.3f})')
                 
 
             ax.axvline(np.mean(real_losses), color='steelblue', linestyle=':')
             ax.axvline(np.mean(synth_losses), color='coral', linestyle=':')
-            ax.axvline(calib_loss, color='lightgreen', linestyle=':', label=f'Calib (μ={calib_loss:.3f})')
+            ax.axvline(np.mean(calib_loss), color='lightgreen', linestyle=':')
             
             ax.set_xlabel('Loss', fontsize=8)
             ax.set_ylabel('Density', fontsize=8)
@@ -3085,7 +4122,14 @@ class ExperimentRunner:
             print("Calibrator is not fitted yet. Run experiment first.")
             return
 
-        weights = self.calibrator.weights
+        if self.calibrator.cl_type == 'per_class':
+            if self._synth_data_cached is None:
+                print("Cached synthetic data not available for per-class weights.")
+                return
+            _, y_synth = self._synth_data_cached
+            weights = self.calibrator.compute_weights_for_samples(y_synth)
+        else:
+            weights = self.calibrator.weights
         
         if weights is None or len(weights) == 0:
             print("No weights found.")
