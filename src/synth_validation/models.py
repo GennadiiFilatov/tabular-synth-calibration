@@ -34,7 +34,7 @@ from sklearn.linear_model import (
 )
 
 # Support Vector Machines
-from sklearn.svm import SVC, LinearSVC, NuSVC, SVR, LinearSVR, NuSVR
+from sklearn.svm import SVC, LinearSVC, SVR, LinearSVR, NuSVR
 
 # Neural Networks
 from sklearn.neural_network import MLPClassifier, MLPRegressor
@@ -190,8 +190,6 @@ class ModelSelectionFramework:
                 {'kernel': 'linear', 'C': 1.0, 'probability': True, 'random_state': RANDOM_SEED}),
             ModelConfig('SVC_Sigmoid', SVC,
                 {'kernel': 'sigmoid', 'C': 1.0, 'gamma': 'scale', 'probability': True, 'random_state': RANDOM_SEED}),
-            ModelConfig('NuSVC', NuSVC,
-                {'nu': 0.5, 'kernel': 'rbf', 'probability': True, 'random_state': RANDOM_SEED}),
 
             # ==================== NEAREST NEIGHBORS ====================
 
