@@ -102,6 +102,100 @@ class EvaluationMetrics:
         return results
 
     @staticmethod
+    def _clamp_k(k: int, n_models: int) -> int:
+        if n_models <= 0:
+            return 0
+        return max(1, min(int(k), n_models))
+
+    @staticmethod
+    def ndcg_at_k(real_losses: np.ndarray,
+                  pred_losses: np.ndarray,
+                  k: int) -> float:
+        """
+        Compute NDCG@k using relevance derived from negative real losses.
+
+        Relevance is scaled to [0, 1] for numerical stability.
+        """
+        real_losses = np.asarray(real_losses, dtype=float)
+        pred_losses = np.asarray(pred_losses, dtype=float)
+        n_models = len(real_losses)
+        if n_models == 0:
+            return np.nan
+
+        k = EvaluationMetrics._clamp_k(k, n_models)
+        if k == 0:
+            return np.nan
+
+        relevance = -real_losses
+        min_rel = np.min(relevance)
+        if min_rel < 0:
+            relevance = relevance - min_rel
+        max_rel = np.max(relevance)
+        if max_rel > 0:
+            relevance = relevance / max_rel
+
+        pred_order = np.argsort(pred_losses)[:k]
+        ideal_order = np.argsort(real_losses)[:k]
+        discounts = 1.0 / np.log2(np.arange(2, k + 2))
+
+        dcg = np.sum(relevance[pred_order] * discounts)
+        idcg = np.sum(relevance[ideal_order] * discounts)
+
+        return dcg / idcg if idcg > 0 else np.nan
+
+    @staticmethod
+    def hit_rate_at_k(real_losses: np.ndarray,
+                      pred_losses: np.ndarray,
+                      k: int) -> float:
+        """
+        Compute Hit-Rate@k based on top-k overlap.
+        """
+        real_losses = np.asarray(real_losses, dtype=float)
+        pred_losses = np.asarray(pred_losses, dtype=float)
+        n_models = len(real_losses)
+        if n_models == 0:
+            return np.nan
+
+        k = EvaluationMetrics._clamp_k(k, n_models)
+        if k == 0:
+            return np.nan
+
+        topk_real = set(np.argsort(real_losses)[:k])
+        topk_pred = set(np.argsort(pred_losses)[:k])
+        return len(topk_real & topk_pred) / k
+
+    @staticmethod
+    def topk_metrics(real_losses: np.ndarray,
+                     pred_losses: np.ndarray,
+                     k: int) -> Dict[str, float]:
+        """
+        Compute top-k metrics (Spearman@k, NDCG@k, Hit-Rate@k).
+        """
+        real_losses = np.asarray(real_losses, dtype=float)
+        pred_losses = np.asarray(pred_losses, dtype=float)
+        n_models = len(real_losses)
+        if n_models == 0:
+            return {'spearman': np.nan, 'ndcg': np.nan, 'hit_rate': np.nan, 'k': 0}
+
+        k = EvaluationMetrics._clamp_k(k, n_models)
+        topk_idx = np.argsort(real_losses)[:k]
+
+        if len(topk_idx) < 2:
+            spearman = np.nan
+        else:
+            spearman, _ = stats.spearmanr(real_losses[topk_idx], pred_losses[topk_idx])
+
+        ndcg = EvaluationMetrics.ndcg_at_k(real_losses, pred_losses, k)
+        hit_rate = EvaluationMetrics.hit_rate_at_k(real_losses, pred_losses, k)
+
+        return {
+            'spearman': float(spearman),
+            'ndcg': float(ndcg),
+            'hit_rate': float(hit_rate),
+            'k': int(k)
+        }
+
+    @staticmethod
     def compute_rank_preservation_with_guarantees(real_errors: np.ndarray,
                                                   synth_errors: np.ndarray) -> Dict[str, float]:
         """
