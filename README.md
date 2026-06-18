@@ -1,7 +1,5 @@
 # tabular-synth-calibration
 
-# tabular-synth-calibration
-
 A research framework for **calibrating synthetic tabular data quality** so that model-selection rankings on synthetic data faithfully reflect rankings on real holdout data. The core contribution is **BPR Calibration** (Bayesian Personalized Ranking), a rank-preserving correction layer that wraps any generative model and significantly improves models' rank preservation between synthetic and real model-evaluation losses.
 
 ---
