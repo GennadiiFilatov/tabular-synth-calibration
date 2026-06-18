@@ -1,150 +1,135 @@
 # tabular-synth-calibration
 
----
+# tabular-synth-calibration
 
-### The Problem
-
-In tabular data domains (healthcare, finance, science), getting labeled validation data is expensive and time-consuming. Synthetic data could be a solution, but current approaches lack theoretical guarantees and often produce misleading model rankings. This leads to:
-- Poor model selection decisions
-- Wasted computational resources
-- Unreliable performance estimates
-
-### Our Solution
-
-We develop a framework based on **constrained optimization calibration for tabular data with interpretability** that:
-1. Generates synthetic validation data using multiple generators (CTGAN, TVAE, TabPFGen, TabDDPM, Gaussian Copula)
-2. Calibrates synthetic data by learning per-sample weights that align synthetic errors with real validation errors
-3. Provides theoretical guarantees on rank preservation through total variation analysis
-4. Delivers confidence intervals for model performance estimates
+A research framework for **calibrating synthetic tabular data quality** so that model-selection rankings on synthetic data faithfully reflect rankings on real holdout data. The core contribution is **BPR Calibration** (Bayesian Personalized Ranking), a rank-preserving correction layer that wraps any generative model and significantly improves models' rank preservation between synthetic and real model-evaluation losses.
 
 ---
 
-## Repository Structure
+## Motivation
+
+Synthetic tabular data is increasingly used as a cheap proxy for real data in model selection and hyperparameter search. However, the *relative ordering* of models by loss on synthetic data is often poorly correlated with the ordering on real data. This project formalises the calibration problem and proposes methods to close that gap without requiring access to a large real test set.
+
+---
+
+## Methods
+
+| Method | Class | Description |
+|---|---|---|
+| **BPR** | `SyntheticBPRCalibrator` | Pairwise ranking loss with temperature, margin penalty (β), and L2 regularisation (λ). Primary contribution. |
+| **Standard** | `SyntheticCalibrator` | Linear/ridge correction baseline. |
+| **Density** | `SyntheticDensityCalibration` | XGBoost-based density-ratio re-weighting. |
+| **PPI** | `PPICalibration` | Prediction-powered inference calibration. |
+
+All methods share a common k-fold evaluation harness (`ExperimentRunner.run_all_calibrations`) that trains calibrators on a held-out calibration split, then measures Spearman rank correlation on a disjoint test set.
+
+---
+
+## Generative Backends
+
+Five pretrained generative models are supported and pre-trained checkpoints are stored under `notebooks/gan_models/`:
+
+- **CTGAN** — Conditional GAN for tabular data (`sdv` / `ctgan`)
+- **TVAE** — Variational autoencoder for tabular data (`sdv`)
+- **TabDDPM** — Denoising diffusion model for tabular data (`synthcity`)
+- **TabPFGen** — Prior-data fitted network generative model (`tabpfgen`)
+- **Gaussian Copula** — Parametric copula baseline (`sdv`)
+
+Each checkpoint is keyed as `{dataset}_{method}_{timestamp}/`.
+
+---
+
+## Datasets
+
+Ten benchmark datasets are used by default, covering both classification and regression:
+
+| Dataset | Task |
+|---|---|
+| `heart_disease` | Classification |
+| `diabetes` | Classification |
+| `german_credit` | Classification |
+| `mushroom` | Classification |
+| `obesity` | Classification |
+| `wine_quality` | Regression |
+| `abalone` | Regression |
+| `california_housing` | Regression |
+| `concrete_strength` | Regression |
+| `diabetes_regression` | Regression |
+
+Datasets are loaded automatically via `ucimlrepo` on first run.
+
+---
+
+## Project Structure
 
 ```
 tabular-synth-calibration/
-├── src/
-│   └── synth_validation/          # Main Python package
-│       ├── __init__.py            # Package exports
-│       ├── runner.py              # ExperimentRunner - main orchestration
-│       ├── calibrator.py          # SyntheticDataCalibrator - sample-level calibration
-│       ├── shap_analizer.py       # SHAPWeightAnalizer - SHAP interpretability
-│       ├── data_loader.py         # DataLoader - UCI dataset loading
-│       ├── generation.py          # SyntheticDataGenerator - CTGAN/TVAE/etc.
-│       ├── models.py              # ModelSelectionFramework - 44 architectures
-│       ├── metrics.py             # EvaluationMetrics - Spearman, rank preservation
-│       ├── confidence.py          # ConfidenceIntervalEstimator - bootstrap/analytical CI
-│       ├── theory.py              # TheoreticalFramework - total variation analysis
-│       └── utils.py               # Constants and utilities
+├── src/synth_validation/
+│   ├── runner.py          # ExperimentRunner — main entry point
+│   ├── calibrator.py      # BPR, Standard, Density, PPI calibrators
+│   ├── generation.py      # SyntheticDataGenerator (CTGAN / TVAE / TabDDPM)
+│   ├── models.py          # Model pool + ModelSelector
+│   ├── metrics.py         # Spearman, NDCG, hit-rate, rank preservation
+│   ├── confidence.py      # CI estimation and aggregation
+│   ├── data_loader.py     # UCI dataset loading and preprocessing
+│   ├── shap_analizer.py   # SHAP-based feature importance
+│   ├── theory.py          # Theoretical bounds and guarantees
+│   └── utils.py           # Shared utilities
 ├── notebooks/
-│   ├── experiment_demo.ipynb      # Demo notebook showing package usage
-│   ├── gan_models                 # Tuned and saved models
-│   └── experiment_figures         # Figures of each exepriment
-└── README.md                      # This file
+│   ├── gan_models/        # Pretrained generative model checkpoints
+│   └── *.ipynb            # Experiment notebooks (Parts 1–3)
+└── requirements.txt
 ```
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.9+
-- CUDA-capable GPU recommended for CTGAN/TVAE training (but not required)
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/ITMO-NSS-team/tabular-synth-calibration.git
-cd tabular-synth-calibration
-
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies (default profile: SDV + TabDDPM)
-pip install -r requirements.txt
-
-# Optional: TabPFGen profile (use a separate environment)
-# pip install -r requirements-tabpfgen.txt
-
-# NOTE:
-# TabPFGen and TabDDPM/synthcity currently require incompatible torch versions
-# on Python 3.12, so they should be installed in separate environments.
-```
-
-### Basic Usage
-
-**Using the Package**
-
 ```python
-import sys
-sys.path.insert(0, './src')
+from src.synth_validation.runner import ExperimentRunner
 
-from synth_validation import ExperimentRunner
-
-# Initialize experiment
 runner = ExperimentRunner(
-    dataset_name='adult',           # UCI dataset
-    synth_method='ctgan',           # or 'tvae', 'gaussian_copula' etc.
-    task_type='classification',
-    lambda_reg=0.5,                 # Calibration regularization
-    verbose=True
+    dataset_name="heart_disease",
+    synth_method="ctgan",          # "ctgan" | "tvae" | "tabddpm" | "tabpfgen" | "gaussian_copula"
+    task_type="classification",
+    gan_model_dir="notebooks/gan_models",
 )
 
-# Run K-fold calibration experiment
-results = runner.run_kfold_calibration_experiment(
+results_standard = runner_standard.run_kfold_calibration_experiment(
     n_folds=5,
-    M_calibration=15,               # Models for calibration
+    M_calibration=15,
     synth_size_multiplier=1.0,
-    analyze_shap=True
+    calib_test_ratio=0.2,
 )
 
-# Visualize results
-runner.visualize_correlation_results()
-runner.print_summary_table()
-runner.plot_weight_histograms()
+results_bpr = runner.run_kfold_bpr_calibration_experiment(
+    n_folds=5,
+    M_calibration=15,
+    synth_size_multiplier=1.0,
+    calib_test_ratio=0.2,
+)
 ```
-
-**Using the Demo Notebook**
-
-1. Open `notebooks/experiment_demo.ipynb` in Jupyter
-2. Execute cells sequentially
-3. The notebook demonstrates:
-   - Package imports and setup
-   - Running experiments
-   - Visualizing correlation results
-   - SHAP weight analysis
 
 ---
 
-## Methodology Details
+## Key Hyperparameters (BPR)
 
-### Calibration Algorithm (Constrained Optimization)
+| Parameter | Default | Effect |
+|---|---|---|
+| `bpr_tau` | 0.1 | Score distribution temperature — keep ≤ 1.0 for regression |
+| `bpr_beta` | 10.0 | Pairwise margin penalty — values < 1 harm regression |
+| `bpr_lambda_reg` | 0.8 | L2 regularisation — higher is better for BPR |
+| `M_calibration` | 25 | Calibration pool size — minimum viable is 10 |
 
-The `SyntheticDataCalibrator` solves a constrained optimization problem to find per-sample weights that align synthetic losses with real validation losses.
-
-**Input:**
-- M calibration models {h₁, ..., h_M}
-- Synthetic data (X_synth, y_synth) with N samples
-- Real validation data (X_real, y_real)
-- Regularization λ (default: 0.1)
-
-**Optimization Problem:**
-
-```
-w* = argmin_w ||l_r - L^T @ w||² + λ||w||²
-
-Subject to: w >= 0 (non-negativity constraint)
-```
-
-Where:
-- `L[i, m]` = loss of model m on synthetic sample i (shape: N × M)
-- `l_r[m]` = average loss of model m on real validation data (shape: M,)
-- `w[i]` = weight for synthetic sample i (shape: N,)
-
-
-**Output:** Non-negative weights w for all synthetic samples
+---
 
 ## Citation
 
