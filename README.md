@@ -1,7 +1,5 @@
 # tabular-synth-calibration
 
-# tabular-synth-calibration
-
 A research framework for **calibrating synthetic tabular data quality** so that model-selection rankings on synthetic data faithfully reflect rankings on real holdout data. The core contribution is **BPR Calibration** (Bayesian Personalized Ranking), a rank-preserving correction layer that wraps any generative model and significantly improves models' rank preservation between synthetic and real model-evaluation losses.
 
 ---
@@ -21,7 +19,7 @@ Synthetic tabular data is increasingly used as a cheap proxy for real data in mo
 | **Density** | `SyntheticDensityCalibration` | XGBoost-based density-ratio re-weighting. |
 | **PPI** | `PPICalibration` | Prediction-powered inference calibration. |
 
-All methods share a common k-fold evaluation harness (`ExperimentRunner.run_all_calibrations`) that trains calibrators on a held-out calibration split, then measures Spearman rank correlation on a disjoint test set.
+All methods share a common k-fold evaluation harness that trains calibrators on a held-out calibration split, then measures Spearman rank correlation on a disjoint test set.
 
 ---
 
@@ -103,7 +101,7 @@ runner = ExperimentRunner(
     gan_model_dir="notebooks/gan_models",
 )
 
-results_standard = runner_standard.run_kfold_calibration_experiment(
+results_standard = runner.run_kfold_calibration_experiment(
     n_folds=5,
     M_calibration=15,
     synth_size_multiplier=1.0,
