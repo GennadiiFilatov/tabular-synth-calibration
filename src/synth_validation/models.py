@@ -3,8 +3,24 @@ Model Selection Framework.
 
 Implementation of model architectures and selection framework for both
 classification and regression tasks.
+
+Redesigned per the semester research plan (WP1-WP2): the calibration pool H
+is restricted to exactly three algorithmic families - XGBoost, RandomForest,
+and MLP - so that:
+  (i)  WP1 (external validity) can run clean Random-vs-LOFO
+       (leave-one-family-out) splits with Heval = one full family;
+  (ii) WP2 (Hcal selection) can compare random / stratified-by-family /
+       K-means-on-loss-profile / pivoted-QR / greedy-max-distance strategies
+       on a pool whose internal diversity is fully controlled by explicit,
+       fixed hyperparameter grids (no accidental redundancy from unrelated
+       model families such as semi-supervised learners, discriminant
+       analysis, or stacking meta-models, which were removed).
+
+Pool size: K = 50 per task type (XGBoost: 20, RandomForest: 15, MLP: 15),
+matching the plan's WP1 notation (Section 3.2, "Pul: K=50").
 """
 
+import itertools
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Any, Optional
@@ -12,53 +28,21 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 from sklearn.metrics import (
-    accuracy_score, log_loss, mean_squared_error, 
+    accuracy_score, log_loss, mean_squared_error,
     mean_absolute_error, r2_score
 )
 from sklearn.dummy import DummyClassifier, DummyRegressor
 
-# Ensemble Models
-from sklearn.ensemble import (
-    RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier,
-    AdaBoostClassifier, BaggingClassifier, HistGradientBoostingClassifier,
-    VotingClassifier, StackingClassifier,
-    RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor,
-    AdaBoostRegressor, BaggingRegressor, HistGradientBoostingRegressor,
-    VotingRegressor, StackingRegressor
-)
-
-# Linear Models
-from sklearn.linear_model import (
-    LogisticRegression, SGDClassifier, LogisticRegressionCV,
-    Ridge, Lasso, ElasticNet, LinearRegression, SGDRegressor
-)
-
-# Support Vector Machines
-from sklearn.svm import SVC, LinearSVC, SVR, LinearSVR, NuSVR
-
-# Neural Networks
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 
-# Tree-Based Models
-from sklearn.tree import (
-    DecisionTreeClassifier, ExtraTreeClassifier,
-    DecisionTreeRegressor, ExtraTreeRegressor
-)
-
-# Neighbors
-from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
-
-# Naive Bayes
-from sklearn.naive_bayes import GaussianNB, MultinomialNB, BernoulliNB, ComplementNB
-
-# Discriminant Analysis
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
-
-# Semi-Supervised
-from sklearn.semi_supervised import LabelSpreading, SelfTrainingClassifier
-
-# Calibration
-from sklearn.calibration import CalibratedClassifierCV
+try:
+    from xgboost import XGBClassifier, XGBRegressor
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "xgboost is required by the WP1/WP2 model pool (K=50: XGBoost/RF/MLP). "
+        "Install it with `pip install xgboost`."
+    ) from exc
 
 from .utils import RANDOM_SEED
 
@@ -69,18 +53,30 @@ class ModelConfig:
     name: str
     model_class: Any
     params: Dict[str, Any]
+    family: str = "unknown"  # 'xgboost' | 'random_forest' | 'mlp' - used by LOFO splits
 
 
 class ModelSelectionFramework:
     """
     Complete framework for model selection using synthetic data.
-    Supports both classification and regression tasks.
+
+    The model pool H = F_xgb ⊔ F_rf ⊔ F_mlp (three families, K=50 total)
+    is the controlled substrate for:
+      - WP1 Random vs. LOFO (leave-one-family-out) transfer experiments,
+      - WP2 calibration-set (Hcal) selection strategies over loss profiles.
     """
+
+    # Fixed pool sizes per family, per the research plan (Section 3.2).
+    N_XGBOOST = 20
+    N_RANDOM_FOREST = 15
+    N_MLP = 15
+
+    FAMILIES = ("xgboost", "random_forest", "mlp")
 
     def __init__(self, task_type: str = 'classification', loss_type: str = None):
         """
         Initialize the model selection framework.
-        
+
         Args:
             task_type: 'classification' or 'regression'
             loss_type: Loss type for optimization. If None, auto-selects:
@@ -88,401 +84,211 @@ class ModelSelectionFramework:
                        - 'mse' for regression
         """
         self.task_type = task_type
-        
-        # Auto-select loss_type based on task if not specified
+
         if loss_type is None:
             loss_type = 'accuracy' if task_type == 'classification' else 'mse'
         self.loss_type = loss_type
-        
+
         self.trained_models = []
         self.results = defaultdict(list)
 
+    # ------------------------------------------------------------------
+    # Architecture pool
+    # ------------------------------------------------------------------
+
     def get_model_architectures(self) -> List[ModelConfig]:
-        """Get model architectures based on task type."""
+        """Get the K=50 model pool (XGBoost 20 + RandomForest 15 + MLP 15)."""
         if self.task_type == 'regression':
-            return self._get_regression_architectures()
-        else:
-            return self._get_classification_architectures()
+            return (
+                self._get_xgboost_architectures_regression()
+                + self._get_random_forest_architectures_regression()
+                + self._get_mlp_architectures_regression()
+            )
+        return (
+            self._get_xgboost_architectures_classification()
+            + self._get_random_forest_architectures_classification()
+            + self._get_mlp_architectures_classification()
+        )
 
-    def _get_classification_architectures(self) -> List[ModelConfig]:
-        """Define diverse classification model architectures."""
+    def get_architectures_by_family(self, family: str) -> List[ModelConfig]:
+        """Return only the architectures belonging to one family (for LOFO splits)."""
+        if family not in self.FAMILIES:
+            raise ValueError(f"Unknown family '{family}'. Expected one of {self.FAMILIES}.")
+        return [a for a in self.get_model_architectures() if a.family == family]
 
-        _logreg_base = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
-        _tree_base   = DecisionTreeClassifier(max_depth=10, random_state=RANDOM_SEED)
-        
-        architectures = [
-            # ==================== ENSEMBLE METHODS ====================
-            
-            # Random Forest variants
-            ModelConfig('RandomForest_Gini', RandomForestClassifier,
-                {'n_estimators': 100, 'criterion': 'gini', 'max_depth': None, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_Entropy', RandomForestClassifier,
-                {'n_estimators': 100, 'criterion': 'entropy', 'max_depth': 15, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_ShallowTrees', RandomForestClassifier,
-                {'n_estimators': 200, 'max_depth': 5, 'min_samples_leaf': 5, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_DeepTrees', RandomForestClassifier,
-                {'n_estimators': 150, 'max_depth': 25, 'min_samples_split': 2, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_Bootstrap', RandomForestClassifier,
-                {'n_estimators': 100, 'criterion': 'gini', 'bootstrap': True, 'oob_score': True, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
+    # ------------------------------------------------------------------
+    # Grid builders - each yields exactly N configs via a deterministic,
+    # evenly-spaced subsample of the full Cartesian grid (so diversity in
+    # loss-space is preserved without combinatorial blow-up).
+    # ------------------------------------------------------------------
 
-            # Gradient Boosting variants
-            ModelConfig('GradientBoosting', GradientBoostingClassifier,
-                {'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 3, 'random_state': RANDOM_SEED}),
-            ModelConfig('GradientBoosting_Deep', GradientBoostingClassifier,
-                {'n_estimators': 150, 'learning_rate': 0.05, 'max_depth': 5, 'random_state': RANDOM_SEED}),
-            ModelConfig('HistGradientBoosting', HistGradientBoostingClassifier,
-                {'max_iter': 100, 'learning_rate': 0.1, 'max_depth': None, 'random_state': RANDOM_SEED}),
+    @staticmethod
+    def _evenly_spaced_grid(grid: Dict[str, List[Any]], n: int, seed: int = RANDOM_SEED) -> List[Dict[str, Any]]:
+        """Deterministically subsample n combinations from a full grid product."""
+        keys = list(grid.keys())
+        combos = list(itertools.product(*[grid[k] for k in keys]))
+        rng = np.random.RandomState(seed)
+        idx = rng.permutation(len(combos))
+        if n > len(combos):
+            raise ValueError(f"Requested {n} configs but grid only has {len(combos)} combinations.")
+        chosen = sorted(idx[:n].tolist())
+        return [dict(zip(keys, combos[i])) for i in chosen]
 
-            # Extra Trees
-            ModelConfig('ExtraTrees', ExtraTreesClassifier,
-                {'n_estimators': 100, 'criterion': 'gini', 'bootstrap': False, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTrees_Entropy', ExtraTreesClassifier,
-                {'n_estimators': 100, 'criterion': 'entropy', 'bootstrap': False, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
+    # ---------------------- XGBoost ----------------------
 
-            # Bagging
-            ModelConfig('Bagging_Tree', BaggingClassifier,
-                {'estimator': DecisionTreeClassifier(), 'n_estimators': 50, 'n_jobs': 1, 'random_state': RANDOM_SEED}),
-            ModelConfig('Bagging_LogReg', BaggingClassifier,
-                {'estimator': LogisticRegression(max_iter=500), 'n_estimators': 20, 'n_jobs': 1, 'random_state': RANDOM_SEED}),
+    def _get_xgboost_architectures_classification(self) -> List[ModelConfig]:
+        grid = {
+            'n_estimators': [50, 100, 200, 300],
+            'max_depth': [3, 5, 7, 9],
+            'learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'subsample': [0.7, 1.0],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_XGBOOST, seed=RANDOM_SEED)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({
+                'colsample_bytree': 0.8,
+                'eval_metric': 'logloss',
+                'n_jobs': -1,
+                'random_state': RANDOM_SEED,
+                'use_label_encoder': False,
+            })
+            archs.append(ModelConfig(
+                name=f'XGB_ne{params["n_estimators"]}_d{params["max_depth"]}'
+                     f'_lr{params["learning_rate"]}_ss{params["subsample"]}_{i}',
+                model_class=XGBClassifier,
+                params=full_params,
+                family='xgboost',
+            ))
+        return archs
 
-            # AdaBoost
-            ModelConfig('AdaBoost_Tree', AdaBoostClassifier,
-                {'n_estimators': 50, 'learning_rate': 1.0, 'random_state': RANDOM_SEED}),
-            ModelConfig('AdaBoost_LogReg', AdaBoostClassifier,
-                {'estimator': LogisticRegression(max_iter=500), 'n_estimators': 20, 'learning_rate': 0.5, 'random_state': RANDOM_SEED}),
-            ModelConfig('AdaBoost_LowLR', AdaBoostClassifier,
-                {'n_estimators': 100, 'learning_rate': 0.5, 'random_state': RANDOM_SEED}),
+    def _get_xgboost_architectures_regression(self) -> List[ModelConfig]:
+        grid = {
+            'n_estimators': [50, 100, 200, 300],
+            'max_depth': [3, 5, 7, 9],
+            'learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'subsample': [0.7, 1.0],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_XGBOOST, seed=RANDOM_SEED + 1)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({
+                'colsample_bytree': 0.8,
+                'n_jobs': -1,
+                'random_state': RANDOM_SEED,
+            })
+            archs.append(ModelConfig(
+                name=f'XGB_ne{params["n_estimators"]}_d{params["max_depth"]}'
+                     f'_lr{params["learning_rate"]}_ss{params["subsample"]}_{i}',
+                model_class=XGBRegressor,
+                params=full_params,
+                family='xgboost',
+            ))
+        return archs
 
-            # ==================== LINEAR MODELS ====================
+    # ---------------------- Random Forest ----------------------
 
-            # Logistic Regression
-            ModelConfig('LogReg_L2_LBFGS', LogisticRegression,
-                {'penalty': 'l2', 'solver': 'lbfgs', 'C': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('LogReg_L1_SAGA', LogisticRegression,
-                {'penalty': 'l1', 'solver': 'saga', 'C': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('LogReg_ElasticNet', LogisticRegression,
-                {'penalty': 'elasticnet', 'solver': 'saga', 'l1_ratio': 0.5, 'C': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('LogReg_L2_LBFGS_CV', LogisticRegressionCV,
-                {'penalty': 'l2', 'solver': 'lbfgs', 'Cs': 5, 'cv': 5, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('LogReg_None', LogisticRegression,
-                {'penalty': None, 'solver': 'lbfgs', 'max_iter': 2000, 'random_state': RANDOM_SEED}),
+    def _get_random_forest_architectures_classification(self) -> List[ModelConfig]:
+        grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 5, 10, 20],
+            'criterion': ['gini', 'entropy'],
+            'min_samples_leaf': [1, 5],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_RANDOM_FOREST, seed=RANDOM_SEED)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({'n_jobs': -1, 'random_state': RANDOM_SEED})
+            depth_tag = params['max_depth'] if params['max_depth'] is not None else 'None'
+            archs.append(ModelConfig(
+                name=f'RF_ne{params["n_estimators"]}_d{depth_tag}'
+                     f'_{params["criterion"]}_msl{params["min_samples_leaf"]}_{i}',
+                model_class=RandomForestClassifier,
+                params=full_params,
+                family='random_forest',
+            ))
+        return archs
 
-            # SGD
-            ModelConfig('SGD_Log_Loss', SGDClassifier,
-                {'loss': 'log_loss', 'penalty': 'l1', 'alpha': 0.0001, 'max_iter': 1000, 'random_state': RANDOM_SEED}),
+    def _get_random_forest_architectures_regression(self) -> List[ModelConfig]:
+        grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 5, 10, 20],
+            'criterion': ['squared_error', 'absolute_error'],
+            'min_samples_leaf': [1, 5],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_RANDOM_FOREST, seed=RANDOM_SEED + 1)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({'n_jobs': -1, 'random_state': RANDOM_SEED})
+            depth_tag = params['max_depth'] if params['max_depth'] is not None else 'None'
+            archs.append(ModelConfig(
+                name=f'RF_ne{params["n_estimators"]}_d{depth_tag}'
+                     f'_{params["criterion"]}_msl{params["min_samples_leaf"]}_{i}',
+                model_class=RandomForestRegressor,
+                params=full_params,
+                family='random_forest',
+            ))
+        return archs
 
-            # Calibrated linear models
-            ModelConfig('Calibrated_LinearSVC', CalibratedClassifierCV,
-                {'estimator': LinearSVC(C=1.0, max_iter=2000, random_state=RANDOM_SEED), 'cv': 3, 'method': 'sigmoid'}),
-            ModelConfig('Calibrated_SGD_Hinge', CalibratedClassifierCV,
-                {'estimator': SGDClassifier(loss='hinge', penalty='l2', alpha=1e-4, max_iter=1000, random_state=RANDOM_SEED),
-                 'cv': 3, 'method': 'sigmoid'}),
-            ModelConfig('Calibrated_LinearSVC_Isotonic', CalibratedClassifierCV,
-                {'estimator': LinearSVC(C=1.0, max_iter=2000, random_state=RANDOM_SEED), 'cv': 3, 'method': 'isotonic'}),
+    # ---------------------- MLP ----------------------
 
-            # ==================== SUPPORT VECTOR MACHINES ====================
+    def _get_mlp_architectures_classification(self) -> List[ModelConfig]:
+        grid = {
+            'hidden_layer_sizes': [(50,), (100,), (100, 50), (100, 50, 25)],
+            'activation': ['relu', 'tanh'],
+            'solver': ['adam', 'sgd'],
+            'alpha': [1e-4, 1e-3],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_MLP, seed=RANDOM_SEED)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({'max_iter': 500, 'random_state': RANDOM_SEED})
+            if params['solver'] == 'sgd':
+                full_params['learning_rate'] = 'adaptive'
+            hl_tag = 'x'.join(str(h) for h in params['hidden_layer_sizes'])
+            archs.append(ModelConfig(
+                name=f'MLP_{hl_tag}_{params["activation"]}_{params["solver"]}_{i}',
+                model_class=MLPClassifier,
+                params=full_params,
+                family='mlp',
+            ))
+        return archs
 
-            ModelConfig('SVC_RBF', SVC,
-                {'kernel': 'rbf', 'C': 1.0, 'gamma': 'scale', 'probability': True, 'random_state': RANDOM_SEED}),
-            ModelConfig('SVC_Poly', SVC,
-                {'kernel': 'poly', 'degree': 2, 'C': 1.0, 'probability': True, 'random_state': RANDOM_SEED}),
-            ModelConfig('SVC_Linear', SVC,
-                {'kernel': 'linear', 'C': 1.0, 'probability': True, 'random_state': RANDOM_SEED}),
-            ModelConfig('SVC_Sigmoid', SVC,
-                {'kernel': 'sigmoid', 'C': 1.0, 'gamma': 'scale', 'probability': True, 'random_state': RANDOM_SEED}),
+    def _get_mlp_architectures_regression(self) -> List[ModelConfig]:
+        grid = {
+            'hidden_layer_sizes': [(50,), (100,), (100, 50), (100, 50, 25)],
+            'activation': ['relu', 'tanh'],
+            'solver': ['adam', 'sgd'],
+            'alpha': [1e-4, 1e-3],
+        }
+        combos = self._evenly_spaced_grid(grid, self.N_MLP, seed=RANDOM_SEED + 1)
+        archs = []
+        for i, params in enumerate(combos):
+            full_params = dict(params)
+            full_params.update({'max_iter': 500, 'random_state': RANDOM_SEED})
+            if params['solver'] == 'sgd':
+                full_params['learning_rate'] = 'adaptive'
+            hl_tag = 'x'.join(str(h) for h in params['hidden_layer_sizes'])
+            archs.append(ModelConfig(
+                name=f'MLP_{hl_tag}_{params["activation"]}_{params["solver"]}_{i}',
+                model_class=MLPRegressor,
+                params=full_params,
+                family='mlp',
+            ))
+        return archs
 
-            # ==================== NEAREST NEIGHBORS ====================
+    # ------------------------------------------------------------------
+    # Training / evaluation (unchanged contract vs. previous version)
+    # ------------------------------------------------------------------
 
-            ModelConfig('KNN_k3_Uniform', KNeighborsClassifier,
-                        {'n_neighbors': 3, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_k7_Distance', KNeighborsClassifier,
-                        {'n_neighbors': 7, 'weights': 'distance', 'algorithm': 'auto'}),
-            ModelConfig('KNN_k15_Uniform', KNeighborsClassifier,
-                        {'n_neighbors': 15, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_L1_k5_Uniform', KNeighborsClassifier,
-                        {'n_neighbors': 5, 'weights': 'uniform', 'metric': 'manhattan'}),
-            ModelConfig('KNN_L1_k10_Distance', KNeighborsClassifier,
-                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'manhattan'}),
-            ModelConfig('KNN_Cosine_k10_Distance', KNeighborsClassifier,
-                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'cosine'}),
-
-            # ==================== NAIVE BAYES ====================
-
-            ModelConfig('GaussianNB_Default', GaussianNB, {}),
-            ModelConfig('GaussianNB_Smooth1e-8', GaussianNB, {'var_smoothing': 1e-8}),
-            ModelConfig('BernoulliNB_Alpha1_Bin0', BernoulliNB, {'alpha': 1.0, 'binarize': 0.0, 'fit_prior': True}),
-            ModelConfig('BernoulliNB_Alpha0p1_Bin05', BernoulliNB, {'alpha': 0.1, 'binarize': 0.5, 'fit_prior': True}),
-            ModelConfig('MultinomialNB_Alpha1', MultinomialNB, {'alpha': 1.0, 'fit_prior': True}),
-            ModelConfig('MultinomialNB_Alpha0p1', MultinomialNB, {'alpha': 0.1, 'fit_prior': True}),
-            ModelConfig('ComplementNB_Alpha1_NoNorm', ComplementNB, {'alpha': 1.0, 'fit_prior': True, 'norm': False}),
-            ModelConfig('ComplementNB_Alpha1_Norm', ComplementNB, {'alpha': 1.0, 'fit_prior': True, 'norm': True}),
-
-            # ==================== DISCRIMINANT ANALYSIS ====================
-
-            ModelConfig('LDA_SVD', LinearDiscriminantAnalysis, {'solver': 'svd'}),
-            ModelConfig('LDA_Eigen', LinearDiscriminantAnalysis, {'solver': 'eigen'}),
-            ModelConfig('LDA_LSQR_Shrink0p1', LinearDiscriminantAnalysis, {'solver': 'lsqr', 'shrinkage': 0.1}),
-            ModelConfig('LDA_LSQR_Shrink0p5', LinearDiscriminantAnalysis, {'solver': 'lsqr', 'shrinkage': 0.5}),
-            ModelConfig('QDA_Reg0', QuadraticDiscriminantAnalysis, {'reg_param': 0.0}),
-            ModelConfig('QDA_Reg0p2', QuadraticDiscriminantAnalysis, {'reg_param': 0.2}),
-            ModelConfig('QDA_Reg0p5', QuadraticDiscriminantAnalysis, {'reg_param': 0.5}),
-
-            # ==================== DECISION TREES ====================
-
-            ModelConfig('DecisionTree_Gini_Full', DecisionTreeClassifier,
-                        {'criterion': 'gini', 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_Gini_Depth10', DecisionTreeClassifier,
-                        {'criterion': 'gini', 'max_depth': 10, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_Entropy_Depth15', DecisionTreeClassifier,
-                        {'criterion': 'entropy', 'max_depth': 15, 'random_state': RANDOM_SEED}),
-            ModelConfig('DecisionTree_Gini_RandomSplit', DecisionTreeClassifier,
-                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 8, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTree_Gini_Deep', ExtraTreeClassifier,
-                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 20, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTree_Entropy_Shallower', ExtraTreeClassifier,
-                        {'criterion': 'entropy', 'splitter': 'random', 'max_depth': 10, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTree_Gini_Full_MaxFeatSqrt', ExtraTreeClassifier,
-                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': None, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTree_Gini_Depth3', ExtraTreeClassifier,
-                        {'criterion': 'gini', 'splitter': 'random', 'max_depth': 3, 'random_state': RANDOM_SEED}),
-
-            # ==================== NEURAL NETWORKS ====================
-
-            ModelConfig('MLP_ReLU_Adam_Mid', MLPClassifier,
-                        {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Deep', MLPClassifier,
-                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Wide', MLPClassifier,
-                        {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Small', MLPClassifier,
-                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD_Mid', MLPClassifier,
-                        {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD_Deep', MLPClassifier,
-                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Logistic_Adam', MLPClassifier,
-                        {'hidden_layer_sizes': (100,), 'activation': 'logistic', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_LBFGS_Small', MLPClassifier,
-                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'lbfgs', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-
-            # ==================== ENSEMBLE META-MODELS ====================
-
-            ModelConfig('VotingClassifier_Soft', VotingClassifier,
-                {'estimators': [
-                    ('rf', RandomForestClassifier(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('svc', SVC(kernel='rbf', probability=True, random_state=RANDOM_SEED)),
-                    ('lr', LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)),
-                ], 'voting': 'soft'}),
-
-            ModelConfig('StackingClassifier_LogReg', StackingClassifier,
-                {'estimators': [
-                    ('rf', RandomForestClassifier(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('gb', GradientBoostingClassifier(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('svc', SVC(kernel='rbf', probability=True, random_state=RANDOM_SEED)),
-                ], 'final_estimator': LogisticRegression(max_iter=1000, random_state=RANDOM_SEED), 'cv': 5}),
-            ModelConfig('StackingClassifier_MLP', StackingClassifier,
-                {'estimators': [
-                    ('rf', RandomForestClassifier(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('gb', GradientBoostingClassifier(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('lr', LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)),
-                ], 'final_estimator': MLPClassifier(hidden_layer_sizes=(50,), max_iter=500, random_state=RANDOM_SEED), 'cv': 5}),
-
-            # ==================== SEMI-SUPERVISED ====================
-
-            ModelConfig('LabelSpreading_KNN', LabelSpreading,
-                {'kernel': 'knn', 'n_neighbors': 10, 'max_iter': 1000}),
-            ModelConfig('SelfTraining_LogReg', SelfTrainingClassifier,
-                {'base_estimator': LogisticRegression(max_iter=1000, random_state=RANDOM_SEED),
-                 'threshold': 0.8, 'verbose': False}),
-            
-            ModelConfig('LabelSpreading_KNN_10_a0p2', LabelSpreading,
-                        {'kernel': 'knn', 'n_neighbors': 10, 'alpha': 0.2, 'max_iter': 1000}),
-            ModelConfig('LabelSpreading_KNN_20_a0p8', LabelSpreading,
-                        {'kernel': 'knn', 'n_neighbors': 20, 'alpha': 0.8, 'max_iter': 1000}),
-            ModelConfig('LabelSpreading_RBF_g20_a0p2', LabelSpreading,
-                        {'kernel': 'rbf', 'gamma': 20.0, 'alpha': 0.2, 'max_iter': 1000}),
-            ModelConfig('LabelSpreading_RBF_g5_a0p8', LabelSpreading,
-                        {'kernel': 'rbf', 'gamma': 5.0, 'alpha': 0.8, 'max_iter': 1000}),
-
-            ModelConfig('SelfTrain_LogReg_Thr0p9', SelfTrainingClassifier,
-                        {'base_estimator': _logreg_base, 'threshold': 0.9, 'criterion': 'threshold', 'max_iter': 20, 'verbose': False}),
-            ModelConfig('SelfTrain_LogReg_Thr0p7', SelfTrainingClassifier,
-                        {'base_estimator': _logreg_base, 'threshold': 0.7, 'criterion': 'threshold', 'max_iter': 20, 'verbose': False}),
-            ModelConfig('SelfTrain_Tree_kBest5', SelfTrainingClassifier,
-                        {'base_estimator': _tree_base, 'criterion': 'k_best', 'k_best': 5, 'max_iter': 20, 'verbose': False}),
-            ModelConfig('SelfTrain_Tree_kBest20', SelfTrainingClassifier,
-                        {'base_estimator': _tree_base, 'criterion': 'k_best', 'k_best': 20, 'max_iter': 20, 'verbose': False}),
-        ]
-
-        return architectures
-
-    def _get_regression_architectures(self) -> List[ModelConfig]:
-        """Define diverse regression model architectures."""
-        
-        architectures = [
-            # ==================== ENSEMBLE METHODS ====================
-            
-            # Random Forest variants
-            ModelConfig('RandomForest_MSE', RandomForestRegressor,
-                {'n_estimators': 100, 'criterion': 'squared_error', 'max_depth': None, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_MAE', RandomForestRegressor,
-                {'n_estimators': 100, 'criterion': 'absolute_error', 'max_depth': 15, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('RandomForest_Shallow', RandomForestRegressor,
-                {'n_estimators': 50, 'max_depth': 8, 'min_samples_split': 10, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            
-            # Gradient Boosting variants
-            ModelConfig('GradientBoosting', GradientBoostingRegressor,
-                {'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 3, 'random_state': RANDOM_SEED}),
-            ModelConfig('GradientBoosting_Deep', GradientBoostingRegressor,
-                {'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'random_state': RANDOM_SEED}),
-            ModelConfig('HistGradientBoosting', HistGradientBoostingRegressor,
-                {'max_iter': 100, 'learning_rate': 0.1, 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('HistGradientBoosting_L1', HistGradientBoostingRegressor,
-                {'max_iter': 100, 'learning_rate': 0.1, 'loss': 'absolute_error', 'random_state': RANDOM_SEED}),
-            
-            # Extra Trees
-            ModelConfig('ExtraTrees', ExtraTreesRegressor,
-                {'n_estimators': 100, 'criterion': 'squared_error', 'bootstrap': False, 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            ModelConfig('ExtraTrees_MAE', ExtraTreesRegressor,
-                {'n_estimators': 100, 'criterion': 'absolute_error', 'n_jobs': -1, 'random_state': RANDOM_SEED}),
-            
-            # Bagging
-            ModelConfig('Bagging_Tree', BaggingRegressor,
-                {'estimator': DecisionTreeRegressor(), 'n_estimators': 50, 'n_jobs': 1, 'random_state': RANDOM_SEED}),
-            ModelConfig('Bagging_SVR', BaggingRegressor,
-                {'estimator': SVR(kernel='rbf'), 'n_estimators': 10, 'max_samples': 0.5, 'n_jobs': 1, 'random_state': RANDOM_SEED}),
-            
-            # AdaBoost
-            ModelConfig('AdaBoost_Tree', AdaBoostRegressor,
-                {'n_estimators': 50, 'learning_rate': 1.0, 'random_state': RANDOM_SEED}),
-            ModelConfig('AdaBoost_Linear', AdaBoostRegressor,
-                {'n_estimators': 50, 'learning_rate': 0.5, 'loss': 'linear', 'random_state': RANDOM_SEED}),
-            
-            # ==================== LINEAR MODELS ====================
-            
-            ModelConfig('LinearRegression', LinearRegression, {}),
-            
-            ModelConfig('Ridge_Alpha1', Ridge, {'alpha': 1.0, 'random_state': RANDOM_SEED}),
-            ModelConfig('Ridge_Alpha10', Ridge, {'alpha': 10.0, 'random_state': RANDOM_SEED}),
-            ModelConfig('Ridge_Alpha01', Ridge, {'alpha': 0.1, 'random_state': RANDOM_SEED}),
-            
-            ModelConfig('Lasso_Alpha1', Lasso, {'alpha': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('Lasso_Alpha01', Lasso, {'alpha': 0.1, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            
-            ModelConfig('ElasticNet_L1_05', ElasticNet,
-                {'alpha': 1.0, 'l1_ratio': 0.5, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('ElasticNet_L1_02', ElasticNet,
-                {'alpha': 1.0, 'l1_ratio': 0.2, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            
-            ModelConfig('SGD_L2', SGDRegressor,
-                {'loss': 'squared_error', 'penalty': 'l2', 'alpha': 0.0001, 'max_iter': 1000, 'random_state': RANDOM_SEED}),
-            ModelConfig('SGD_L1', SGDRegressor,
-                {'loss': 'squared_error', 'penalty': 'l1', 'alpha': 0.0001, 'max_iter': 1000, 'random_state': RANDOM_SEED}),
-            ModelConfig('SGD_Huber', SGDRegressor,
-                {'loss': 'huber', 'penalty': 'l2', 'alpha': 0.0001, 'max_iter': 1000, 'random_state': RANDOM_SEED}),
-            
-            # ==================== SUPPORT VECTOR MACHINES ====================
-            
-            ModelConfig('SVR_RBF', SVR, {'kernel': 'rbf', 'C': 1.0, 'gamma': 'scale'}),
-            ModelConfig('SVR_Linear', LinearSVR, {'C': 1.0, 'max_iter': 2000, 'random_state': RANDOM_SEED}),
-            ModelConfig('SVR_Poly', SVR, {'kernel': 'poly', 'degree': 2, 'C': 1.0}),
-            ModelConfig('NuSVR', NuSVR, {'nu': 0.5, 'kernel': 'rbf', 'C': 1.0}),
-
-            ModelConfig('SVR_RBF_C1_e0p1', SVR, {'kernel': 'rbf', 'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale'}),
-            ModelConfig('SVR_RBF_C10_e0p01', SVR, {'kernel': 'rbf', 'C': 10.0, 'epsilon': 0.01, 'gamma': 'scale'}),
-            ModelConfig('SVR_RBF_C0p1_e0p2', SVR, {'kernel': 'rbf', 'C': 0.1, 'epsilon': 0.2, 'gamma': 'scale'}),
-            ModelConfig('LinSVR_C1', LinearSVR, {'C': 1.0, 'epsilon': 0.1, 'max_iter': 5000, 'random_state': RANDOM_SEED}),
-            ModelConfig('LinSVR_C0p1_L2Loss', LinearSVR, 
-                        {'C': 0.1, 'epsilon': 0.1, 'loss': 'squared_epsilon_insensitive', 'max_iter': 5000, 'random_state': RANDOM_SEED}),
-            ModelConfig('SVR_Poly_deg2', SVR, {'kernel': 'poly', 'degree': 2, 'C': 1.0, 'epsilon': 0.1, 'gamma': 'scale'}),
-            ModelConfig('SVR_Poly_deg3_C10', SVR, {'kernel': 'poly', 'degree': 3, 'C': 10.0, 'epsilon': 0.1, 'gamma': 'scale'}),
-            ModelConfig('NuSVR_RBF_nu0p5', NuSVR, {'kernel': 'rbf', 'C': 1.0, 'nu': 0.5, 'gamma': 'scale'}),
-            
-            # ==================== NEAREST NEIGHBORS ====================
-            
-            ModelConfig('KNN_k3_Uniform', KNeighborsRegressor,
-                        {'n_neighbors': 3, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_k7_Distance', KNeighborsRegressor,
-                        {'n_neighbors': 7, 'weights': 'distance', 'algorithm': 'auto'}),
-            ModelConfig('KNN_k15_Uniform', KNeighborsRegressor,
-                        {'n_neighbors': 15, 'weights': 'uniform', 'algorithm': 'auto'}),
-            ModelConfig('KNN_L1_k5_Uniform', KNeighborsRegressor,
-                        {'n_neighbors': 5, 'weights': 'uniform', 'metric': 'manhattan'}),
-            ModelConfig('KNN_L1_k10_Distance', KNeighborsRegressor,
-                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'manhattan'}),
-            ModelConfig('KNN_Cosine_k10_Distance', KNeighborsRegressor,
-                        {'n_neighbors': 10, 'weights': 'distance', 'metric': 'cosine'}),
-            
-            # ==================== TREE-BASED MODELS ====================
-
-            ModelConfig('DTree_SqErr_Full', DecisionTreeRegressor,
-                        {'criterion': 'squared_error', 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('DTree_SqErr_Shallow', DecisionTreeRegressor,
-                        {'criterion': 'squared_error', 'max_depth': 10, 'min_samples_split': 10, 'random_state': RANDOM_SEED}),
-            ModelConfig('DTree_SqErr_Depth15_MaxFeatSqrt', DecisionTreeRegressor,
-                        {'criterion': 'squared_error', 'max_depth': 15, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
-            ModelConfig('DTree_AbsErr_Depth15', DecisionTreeRegressor,
-                        {'criterion': 'absolute_error', 'max_depth': 15, 'random_state': RANDOM_SEED}),
-            ModelConfig('ETree_SqErr_Full', ExtraTreeRegressor,
-                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': None, 'random_state': RANDOM_SEED}),
-            ModelConfig('ETree_SqErr_Depth10', ExtraTreeRegressor,
-                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': 10, 'random_state': RANDOM_SEED}),
-            ModelConfig('ETree_AbsErr_Depth15_MaxFeatSqrt', ExtraTreeRegressor,
-                        {'criterion': 'absolute_error', 'splitter': 'random', 'max_depth': 15, 'max_features': 'sqrt', 'random_state': RANDOM_SEED}),
-            ModelConfig('ETree_SqErr_Depth3', ExtraTreeRegressor,
-                        {'criterion': 'squared_error', 'splitter': 'random', 'max_depth': 3, 'random_state': RANDOM_SEED}),
-            
-            # ==================== NEURAL NETWORKS ====================
-            
-            ModelConfig('MLP_ReLU_Adam_Mid', MLPRegressor,
-                        {'hidden_layer_sizes': (100,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Deep', MLPRegressor,
-                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Wide', MLPRegressor,
-                        {'hidden_layer_sizes': (200, 100), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_Adam_Small', MLPRegressor,
-                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD_Mid', MLPRegressor,
-                        {'hidden_layer_sizes': (50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Tanh_SGD_Deep', MLPRegressor,
-                        {'hidden_layer_sizes': (100, 50, 25), 'activation': 'tanh', 'solver': 'sgd', 'learning_rate': 'adaptive', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_Logistic_Adam', MLPRegressor,
-                        {'hidden_layer_sizes': (100,), 'activation': 'logistic', 'solver': 'adam', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-            ModelConfig('MLP_ReLU_LBFGS_Small', MLPRegressor,
-                        {'hidden_layer_sizes': (50,), 'activation': 'relu', 'solver': 'lbfgs', 'max_iter': 500, 'random_state': RANDOM_SEED}),
-
-            
-            # ==================== ENSEMBLE META-MODELS ====================
-            
-            ModelConfig('VotingRegressor', VotingRegressor,
-                {'estimators': [
-                    ('rf', RandomForestRegressor(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('svr', SVR(kernel='rbf')),
-                    ('ridge', Ridge(alpha=1.0))
-                ]}),
-            
-            ModelConfig('StackingRegressor_Ridge', StackingRegressor,
-                {'estimators': [
-                    ('rf', RandomForestRegressor(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('gb', GradientBoostingRegressor(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('svr', SVR(kernel='rbf')),
-                ], 'final_estimator': Ridge(alpha=1.0), 'cv': 5}),
-            
-            ModelConfig('StackingRegressor_Linear', StackingRegressor,
-                {'estimators': [
-                    ('rf', RandomForestRegressor(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('et', ExtraTreesRegressor(n_estimators=50, random_state=RANDOM_SEED)),
-                    ('ridge', Ridge(alpha=1.0)),
-                ], 'final_estimator': LinearRegression(), 'cv': 5}),
-        ]
-
-        return architectures
-    
     def train_model(self, config: ModelConfig, X_train: pd.DataFrame,
-               y_train: pd.Series, random_seed: Optional[int] = None) -> Any:
+                     y_train: pd.Series, random_seed: Optional[int] = None) -> Any:
         """Train a single model with given configuration."""
-        
-        # For classification: check if only one class
         if self.task_type == 'classification' and len(y_train.unique()) < 2:
             model = DummyClassifier(strategy='most_frequent')
             model.fit(X_train, y_train)
@@ -503,28 +309,25 @@ class ModelSelectionFramework:
             else:
                 model = DummyRegressor(strategy='mean')
             model.fit(X_train, y_train)
-        return model
+            return model
 
     def evaluate_model(self, model: Any, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
         """
         Evaluate model performance.
-        
+
         For classification: accuracy, log_loss
-        For regression: MSE, MAE, R²
+        For regression: MSE, MAE, R^2
         """
         predictions = model.predict(X)
-        
+
         if self.task_type == 'regression':
             mse = mean_squared_error(y, predictions)
             mae = mean_absolute_error(y, predictions)
             r2 = r2_score(y, predictions)
             rmse = np.sqrt(mse)
-            
-            if self.loss_type == 'mae':
-                loss = mae
-            else:
-                loss = mse
-            
+
+            loss = mae if self.loss_type == 'mae' else mse
+
             return {
                 'loss': loss, 'mse': mse, 'rmse': rmse,
                 'mae': mae, 'r2': r2, 'predictions': predictions
@@ -532,7 +335,7 @@ class ModelSelectionFramework:
         else:
             accuracy = accuracy_score(y, predictions)
             loss = 1.0 - accuracy
-            
+
             if self.loss_type == 'log_loss':
                 if hasattr(model, 'predict_proba'):
                     try:
@@ -543,16 +346,16 @@ class ModelSelectionFramework:
                             loss = log_loss(y, proba)
                     except Exception:
                         pass
-            
+
             return {
                 'loss': loss, 'accuracy': accuracy, 'predictions': predictions
             }
 
     def random_seed_train(self, config: ModelConfig,
-                             X_train: pd.DataFrame, y_train: pd.Series,
-                             X_synth: pd.DataFrame, y_synth: pd.Series,
-                             X_test: pd.DataFrame, y_test: pd.Series,
-                             seed: int = 10) -> Dict:
+                           X_train: pd.DataFrame, y_train: pd.Series,
+                           X_synth: pd.DataFrame, y_synth: pd.Series,
+                           X_test: pd.DataFrame, y_test: pd.Series,
+                           seed: int = 10) -> Dict:
         """Train model with a specific random seed and evaluate."""
         results = {
             'seed': [], 'synth_losses': [], 'test_losses': [],
