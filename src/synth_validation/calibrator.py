@@ -1312,3 +1312,232 @@ class PPICalibration:
             y_real_small=y_real_small,
             annotator_model=annotator_model,
         )
+
+
+class SyntheticKMMCalibration:
+    """Calibrate synthetic samples using Kernel Mean Matching (KMM).
+
+    Ported from https://github.com/awesomeslayer/Importance-reweighting
+    (source/estimations.py: kernel_mean_matching / compute_rbf / adjust_sigma).
+    Solves the moment-matching QP
+
+        min_w  0.5 * w^T K w - kappa^T w
+        s.t.   0 <= w_i <= B,  |sum(w_i) - n_synth| <= n_synth * eps
+
+    on standardized features, then renormalizes so that weights sum to 1
+    (matching the convention used by SyntheticDensityCalibration.fit,
+    which returns `weights = weights / weights.sum()`), so
+    evaluate_calibrated_loss / compute_weights_for_samples plug into the
+    rest of this file's pipeline (and runner.py's `sample_losses @ weights`
+    convention) without modification.
+    """
+
+    def __init__(
+        self,
+        kern: str = "rbf",
+        B: float = 1000.0,
+        eps: Optional[float] = None,
+        sigma: Optional[float] = None,
+        max_real_ref: int = 2000,
+        max_synth_ref: int = 2000,
+        random_state: Optional[int] = None,
+        verbose: bool = False,
+        task_type: str = "classification",
+        loss_type: str = "log_loss",
+    ) -> None:
+        self.kern = kern
+        self.B = B
+        self.eps = eps
+        self.sigma = sigma
+        self.max_real_ref = max_real_ref
+        self.max_synth_ref = max_synth_ref
+        self.random_state = random_state
+        self.verbose = verbose
+        self.task_type = task_type
+        self.loss_type = loss_type
+
+        self.weights: Optional[np.ndarray] = None
+        self.fitted = False
+        self._mu = None
+        self._sigma_scale = None
+
+    # ------------------------------------------------------------------
+    def _to_numpy_1d(self, y: Any) -> np.ndarray:
+        return y.values if hasattr(y, "values") else np.array(y)
+
+    def _standardize(self, X_real: np.ndarray, X_synth: np.ndarray):
+        stacked = np.vstack([X_real, X_synth])
+        self._mu = stacked.mean(axis=0)
+        self._sigma_scale = stacked.std(axis=0)
+        self._sigma_scale[self._sigma_scale == 0] = 1.0
+        return (X_real - self._mu) / self._sigma_scale, (X_synth - self._mu) / self._sigma_scale
+
+    @staticmethod
+    def _compute_rbf(X: np.ndarray, Z: np.ndarray, sigma: float) -> np.ndarray:
+        K = np.zeros((X.shape[0], Z.shape[0]), dtype=float)
+        for i, vx in enumerate(X):
+            K[i, :] = np.exp(-np.sum((vx - Z) ** 2, axis=1) / (2.0 * sigma))
+        return K
+
+    @staticmethod
+    def _adjust_sigma(data: np.ndarray) -> float:
+        n = len(data)
+        if n < 2:
+            return 1.0
+        pairwise_dists = np.sum((data[:, None] - data[None, :]) ** 2, axis=-1)
+        nonzero = pairwise_dists[pairwise_dists > 0]
+        median_dist = np.median(nonzero) if nonzero.size > 0 else 1.0
+        denom = np.log(max(n, 2))
+        return float(median_dist / denom) if denom > 0 else float(median_dist)
+
+    # ------------------------------------------------------------------
+    def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
+        n_samples = len(X)
+        y_arr = self._to_numpy_1d(y)
+
+        if self.loss_type == "log_loss":
+            if not hasattr(model, "predict_proba"):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+            try:
+                proba = model.predict_proba(X)
+            except (ValueError, RuntimeError):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+            if np.any(np.isnan(proba)):
+                preds = model.predict(X)
+                return (preds != y_arr).astype(np.float64)
+
+            classes = model.classes_
+            eps = 1e-15
+            proba = np.clip(proba, eps, 1 - eps)
+            sample_losses = np.full(n_samples, -np.log(eps), dtype=np.float64)
+            for i in range(n_samples):
+                class_idx = np.where(classes == y_arr[i])[0]
+                if len(class_idx) == 0:
+                    continue
+                sample_losses[i] = -np.log(proba[i, class_idx[0]])
+            return np.clip(sample_losses, 0.0, MAX_LOG_LOSS)
+
+        if self.loss_type == "accuracy":
+            preds = model.predict(X)
+            return (preds != y_arr).astype(np.float64)
+
+        if self.loss_type == "mse":
+            preds = model.predict(X)
+            return ((preds - y_arr) ** 2).astype(np.float64)
+
+        if self.loss_type == "mae":
+            preds = model.predict(X)
+            return np.abs(preds - y_arr).astype(np.float64)
+
+        raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+    # ------------------------------------------------------------------
+    def _solve_kmm_qp(self, Z_synth: np.ndarray, Z_real: np.ndarray) -> np.ndarray:
+        """Solve the KMM QP with cvxpy, consistent with the solver library
+        already used elsewhere in this file (SyntheticDataCalibrator /
+        SyntheticBPRCalibrator use cvxpy/scipy.optimize, not cvxopt)."""
+        n_synth = Z_synth.shape[0]
+        n_real = Z_real.shape[0]
+
+        eps = self.eps if self.eps is not None else max(1e-6, self.B / np.sqrt(n_synth))
+
+        if self.kern == "lin":
+            K = Z_synth @ Z_synth.T
+            kappa = np.sum((Z_synth @ Z_real.T) * float(n_synth) / float(n_real), axis=1)
+        elif self.kern == "rbf":
+            sigma = self.sigma if self.sigma is not None else self._adjust_sigma(Z_synth)
+            K = self._compute_rbf(Z_synth, Z_synth, sigma=sigma)
+            kappa = np.sum(self._compute_rbf(Z_synth, Z_real, sigma=sigma), axis=1) * float(n_synth) / float(n_real)
+        else:
+            raise ValueError(f"Unknown kernel '{self.kern}'. Expected 'lin' or 'rbf'.")
+
+        K = K + 1e-8 * np.eye(n_synth)  # numerical jitter for PSD stability
+
+        w = cp.Variable(n_synth)
+        objective = cp.Minimize(0.5 * cp.quad_form(w, cp.psd_wrap(K)) - kappa @ w)
+        constraints = [
+            w >= 0,
+            w <= self.B,
+            cp.sum(w) <= n_synth * (1 + eps),
+            cp.sum(w) >= n_synth * (1 - eps),
+        ]
+        problem = cp.Problem(objective, constraints)
+        try:
+            problem.solve(solver=cp.OSQP)
+            if w.value is None or problem.status not in ("optimal", "optimal_inaccurate"):
+                if self.verbose:
+                    print(f"  KMM QP status={problem.status}; falling back to uniform weights.")
+                return np.ones(n_synth)
+            coef = np.asarray(w.value).flatten()
+        except Exception as exc:
+            if self.verbose:
+                print(f"  KMM QP raised {exc!r}; falling back to uniform weights.")
+            return np.ones(n_synth)
+
+        return np.clip(coef, 0, self.B)
+
+    # ------------------------------------------------------------------
+    def fit(self, X_real: pd.DataFrame, X_synth: pd.DataFrame) -> np.ndarray:
+        n_real = len(X_real)
+        n_synth = len(X_synth)
+
+        if n_real <= 0 or n_synth <= 0:
+            raise ValueError("Both real and synthetic datasets must be non-empty.")
+        if X_real.shape[1] != X_synth.shape[1]:
+            raise ValueError("Real and synthetic feature dimensions do not match.")
+
+        Xr = np.asarray(X_real, dtype=float)
+        Xs = np.asarray(X_synth, dtype=float)
+        Xr_std, Xs_std = self._standardize(Xr, Xs)
+
+        rng = np.random.RandomState(self.random_state)
+
+        Xr_fit = Xr_std if n_real <= self.max_real_ref else Xr_std[
+            rng.choice(n_real, self.max_real_ref, replace=False)
+        ]
+        if n_synth <= self.max_synth_ref:
+            fit_idx = np.arange(n_synth)
+        else:
+            fit_idx = rng.choice(n_synth, self.max_synth_ref, replace=False)
+        Xs_fit = Xs_std[fit_idx]
+
+        raw_weights = self._solve_kmm_qp(Xs_fit, Xr_fit)
+
+        full_weights = np.ones(n_synth, dtype=np.float64)
+        full_weights[fit_idx] = raw_weights
+
+        weight_sum = float(np.sum(full_weights))
+        if not np.isfinite(weight_sum) or weight_sum <= 0:
+            full_weights = np.full(n_synth, 1.0 / n_synth, dtype=np.float64)
+        else:
+            full_weights = full_weights / weight_sum
+
+        self.weights = full_weights
+        self.fitted = True
+
+        if self.verbose:
+            print("\n" + "=" * 70)
+            print("CALIBRATING SYNTHETIC SAMPLES (KMM)")
+            print("=" * 70)
+            print(f"  kern={self.kern}, B={self.B}, real_used={Xr_fit.shape[0]}, synth_used={len(fit_idx)}")
+            print(f"  Weight sum: {self.weights.sum():.6f}, max weight: {self.weights.max():.6f}")
+
+        return self.weights
+
+    def calibrated_risk(self, h_losses_synth: np.ndarray) -> float:
+        if not self.fitted or self.weights is None:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
+        return float(np.dot(self.weights, h_losses_synth))
+
+    def evaluate_calibrated_loss(self, model: Any, X_synth: pd.DataFrame, y_synth: pd.Series) -> float:
+        if not self.fitted:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
+        sample_losses = self._compute_sample_losses(model, X_synth, y_synth)
+        return float(sample_losses @ self.weights)
+
+    def compute_weights_for_samples(self, y_synth: Optional[pd.Series] = None) -> np.ndarray:
+        if not self.fitted or self.weights is None:
+            raise ValueError("Calibrator not fitted. Call fit() first.")
+        return self.weights.copy()
