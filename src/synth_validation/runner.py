@@ -21,14 +21,23 @@ from .generation import SyntheticDataGenerator
 from .models import ModelSelectionFramework, ModelConfig
 from .confidence import ConfidenceIntervalEstimator
 from .metrics import EvaluationMetrics
+from .utility_decomposition import (
+    feature_fidelity_proxy,
+    relationship_estimation_proxy,
+    model_specification_proxy,
+    fit_weight_surrogate,
+)
 from .calibrator import (
     SyntheticDataCalibrator,
     SyntheticBPRCalibrator,
     SyntheticDensityCalibration,
     PPICalibration,
+    SyntheticKMMCalibration,
 )
 from .shap_analizer import SHAPWeightsAnalyzer
 from typing import Any, Optional, Union, List, Dict, Tuple, Callable
+from sklearn.base import clone
+from xgboost import XGBClassifier, XGBRegressor
 
 
 class ExperimentRunner:
@@ -64,7 +73,13 @@ class ExperimentRunner:
                  density_xgb_reg_alpha: float = 0.0,
                  density_xgb_tree_method: str = 'hist',
                  density_xgb_n_jobs: int = -1,
-                 density_random_state: Optional[int] = None
+                 density_random_state: Optional[int] = None,
+                 kmm_kern: str = 'rbf',
+                 kmm_B: float = 1000.0,
+                 kmm_eps: Optional[float] = None,
+                 kmm_sigma: Optional[float] = None,
+                 kmm_max_real_ref: int = 2000,
+                 kmm_max_synth_ref: int = 2000,
                  ) -> None:
         """
         Initialize experiment runner.
@@ -123,6 +138,15 @@ class ExperimentRunner:
         self.density_xgb_tree_method = density_xgb_tree_method
         self.density_xgb_n_jobs = density_xgb_n_jobs
         self.density_random_state = density_random_state
+
+        self._last_kmm_calibrator = None
+        self.kmm_kern = kmm_kern
+        self.kmm_B = kmm_B
+        self.kmm_eps = kmm_eps
+        self.kmm_sigma = kmm_sigma
+        self.kmm_max_real_ref = kmm_max_real_ref
+        self.kmm_max_synth_ref = kmm_max_synth_ref
+
         # Auto-select loss_type based on task
         if loss_type is None:
             loss_type = 'log_loss' if task_type == 'classification' else 'mae'
@@ -267,6 +291,68 @@ class ExperimentRunner:
         )
         
         return synth_generator
+
+    def analyze_weight_decomposition(
+            self,
+            weights: np.ndarray,
+            X_synth: pd.DataFrame,
+            y_synth: pd.Series,
+            X_real: pd.DataFrame,
+            y_real: pd.Series,
+            eval_models: List[Any],
+            oracle_real_preds: np.ndarray,
+            oracle_synth_preds: np.ndarray,
+            verbose: bool = True,
+        ) -> Dict[str, Any]:
+        
+        r_hat = feature_fidelity_proxy(
+            X_real=X_real,
+            X_synth=X_synth,
+        )
+
+        eps_hat = relationship_estimation_proxy(
+            X_synth=X_synth,
+            y_synth=y_synth,
+            X_real=X_real,
+            y_real=y_real,
+            task_type=self.task_type,
+        )
+
+        v_hat = model_specification_proxy(
+            eval_models=eval_models,
+            X_synth=X_synth,
+            oracle_real_preds=oracle_real_preds,
+            oracle_synth_preds=oracle_synth_preds,
+            task_type=self.task_type,
+        )
+
+        surrogate, in_sample_r2, cv_r2, proxy_df, diagnostics = fit_weight_surrogate(
+            w=weights,
+            r_hat=r_hat,
+            eps_hat=eps_hat,
+            v_hat=v_hat,
+            random_state=CV_RANDOM_STATE,
+        )
+
+        if verbose:
+            print(f"\n  Surrogate in-sample R^2:  {in_sample_r2:.4f}")
+            print(f"  Surrogate CV (honest) R^2: {cv_r2:.4f}")
+            print(f"  Proxy summary:")
+            print(f"    feature_fidelity        mean={r_hat.mean():.4f}  std={r_hat.std():.4f}")
+            print(f"    relationship_estimation mean={eps_hat.mean():.4f}  std={eps_hat.std():.4f}")
+            print(f"    model_specification     mean={v_hat.mean():.4f}  std={v_hat.std():.4f}")
+
+        return {
+            "in_sample_r2": in_sample_r2,
+            "cv_r2": cv_r2,
+            "proxy_df": proxy_df,
+            "diagnostics": diagnostics,
+            "surrogate": surrogate,
+            "feature_fidelity": r_hat,
+            "relationship_estimation": eps_hat,
+            "model_specification": v_hat,
+        }
+    
 
     def run_kfold_calibration_experiment_perclass(self,
                                           n_folds: int = 5,
@@ -1043,9 +1129,34 @@ class ExperimentRunner:
                 # Fallback: store the whole generator
                 self._synthesizer = fold_generator
             self._synth_generator = fold_generator
+
+        def _fit_cross_fitted_eta(X, y, X_eval, task_type="classification",
+                                   n_splits=5, base_estimator=None, random_state=None):
+                X_arr = X.values if hasattr(X, "values") else np.asarray(X)
+                y_arr = y.values if hasattr(y, "values") else np.asarray(y)
+                X_eval_arr = X_eval.values if hasattr(X_eval, "values") else np.asarray(X_eval)
+        
+                if base_estimator is None:
+                    base_estimator = XGBClassifier(
+                        n_estimators=300, max_depth=5, learning_rate=0.1,
+                        tree_method="hist", n_jobs=-1, verbosity=0
+                    )
+        
+                splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+                fold_preds = []
+        
+                for train_idx, _ in splitter.split(X_arr, y_arr):
+                    model = clone(base_estimator)
+                    model.fit(X_arr[train_idx], y_arr[train_idx])
+                    pred = model.predict_proba(X_eval_arr)[:, 1]
+                    fold_preds.append(pred)
+        
+                return np.mean(np.stack(fold_preds, axis=0), axis=0)
         
         # SHAP analysis
         shap_analyzer = None
+        weight_decomposition = None
+        calibration_weights = None
         if analyze_shap and self._synth_data_cached is not None:
             calibration_weights = self.calibrator.compute_weights_for_samples(y_synth)
             
@@ -1064,7 +1175,38 @@ class ExperimentRunner:
                     verbose=self.verbose
                 )
 
-        # Store results
+        if calibration_weights is not None and len(calibration_weights) > 0:
+
+            oracle_real_probs = _fit_cross_fitted_eta(
+                X=X_train_calib,
+                y=y_train_calib,
+                X_eval=X_synth,
+                task_type=self.task_type,
+                random_state=CV_RANDOM_STATE + fold_idx,
+            )
+            oracle_real_preds = (oracle_real_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_real_probs
+
+            oracle_synth_probs = _fit_cross_fitted_eta(
+                X=X_synth,
+                y=y_synth,
+                X_eval=X_synth,
+                task_type=self.task_type,
+                random_state=CV_RANDOM_STATE + fold_idx,
+            )
+            oracle_synth_preds = (oracle_synth_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_synth_probs
+
+            weight_decomposition = self.analyze_weight_decomposition(
+                weights=calibration_weights,
+                X_synth=X_synth,
+                y_synth=y_synth,
+                X_real=X_test_calib,
+                y_real=y_test_calib,
+                eval_models=trained_m_test_models,
+                oracle_real_preds=oracle_real_preds,
+                oracle_synth_preds=oracle_synth_preds,
+                verbose=self.verbose,
+            )
+
         self.results = {
             'dataset': self.dataset_name,
             'synth_method': self.synth_method,
@@ -1073,12 +1215,13 @@ class ExperimentRunner:
             'M_calibration': M_calibration,
             'n_evaluation_models': n_total_models - M_calibration,
             'fold_results': fold_results,
-            'iteration_results': fold_results,  # Backward compatibility
+            'iteration_results': fold_results,
             'uncalibrated_stats': uncalib_stats,
             'calibrated_stats': calib_stats,
             'uncalibrated_spearmans': all_uncalibrated_spearmans,
             'calibrated_spearmans': all_calibrated_spearmans,
-            'shap_analyzer': shap_analyzer
+            'shap_analyzer': shap_analyzer,
+            'weight_decomposition': weight_decomposition
         }
         
         if self.verbose:
@@ -1213,6 +1356,279 @@ class ExperimentRunner:
         models_test  = [trained_models[i] for i in remaining]
 
         return archs_train, archs_test, models_train, models_test
+
+    def run_kfold_kmm_calibration_experiment(self,
+                                                n_folds: int = 5,
+                                                M_calibration: int = 10,
+                                                synth_size_multiplier: float = 1.0,
+                                                calib_test_ratio: float = 0.2,
+                                                tune_synthetic: bool = False,
+                                                n_tune_trials: int = 40,
+                                                analyze_shap: bool = True,
+                                                shap_plot_types: List[str] = ["dot"],
+                                                shap_max_display: int = 15) -> Dict:
+        """
+        K-fold cross-validation experiment using Kernel Mean Matching (KMM)
+        calibration (ported from awesomeslayer/Importance-reweighting).
+        Structurally identical to run_kfold_density_calibration_experiment;
+        only the calibrator and its fit/weight calls differ.
+        """
+        if self.verbose:
+            print("\n" + "=" * 80)
+            print("K-FOLD KMM CALIBRATION EXPERIMENT")
+            print("=" * 80)
+            print(f"\n[1/6] Loading dataset: {self.dataset_name}...")
+
+        df = self.data_loader.load_uci_dataset(self.dataset_name)
+        target_col = None
+        for col in ['income', 'target', 'class']:
+            if col in df.columns:
+                target_col = col
+                break
+        if target_col is None:
+            target_col = df.columns[-1]
+
+        X_full = df.drop(columns=[target_col]).copy()
+        y_full = df[target_col].copy()
+
+        if self.verbose:
+            print(f"   Samples: {len(X_full)}, Features: {X_full.shape[1]}")
+
+        if tune_synthetic and self._synthesizer is None:
+            # identical GAN-tuning block as run_kfold_density_calibration_experiment
+            if self.task_type == 'classification':
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE, stratify=y_full
+                )
+            else:
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
+                    X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+            X_ref_train_proc, _, y_ref_train_proc, _, _ = self.data_loader.prepare_data(
+                X_ref_train, X_ref_test, y_ref_train, y_ref_test, task_type=self.task_type
+            )
+            if self.task_type == 'classification':
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE, stratify=y_ref_train_proc
+                )
+            else:
+                X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
+                )
+            ref_generator = SyntheticDataGenerator(method=self.synth_method, task_type=self.task_type)
+            ref_generator.fit(
+                X_train=X_ref_train_proc, y_train=y_ref_train_proc,
+                X_val=X_ref_val_proc, y_val=y_ref_val_proc,
+                tune_hyperparams=True, n_trials=n_tune_trials,
+                quality_metric='swd', verbose=self.verbose
+            )
+            self._best_hyperparams = ref_generator.best_hyperparams
+            self._synthesizer = ref_generator.synthesizer
+            self._synth_generator = ref_generator
+            if self.verbose:
+                print(f"   Best hyperparameters: {self._best_hyperparams}")
+        else:
+            if self.verbose:
+                print(f"\n[2/6] Skipping GAN tuning")
+
+        if self.verbose:
+            print(f"\n[3/6] Setting up model architectures...")
+            print(f"   KMM config: kern={self.kmm_kern}, B={self.kmm_B}, eps={self.kmm_eps}, sigma={self.kmm_sigma}")
+
+        all_architectures = self.model_selector.get_model_architectures()
+        n_total_models = len(all_architectures)
+        if M_calibration >= n_total_models:
+            raise ValueError(f"M_calibration ({M_calibration}) must be < total architectures ({n_total_models})")
+        if self.verbose:
+            print(f"   Total: {n_total_models}, M_train: {M_calibration}, M_test: {n_total_models - M_calibration}")
+
+        if self.verbose:
+            print(f"\n[4/6] Setting up {n_folds}-fold cross-validation...")
+        if self.task_type == 'classification':
+            kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full, y_full)
+        else:
+            kfold = KFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
+            fold_iterator = kfold.split(X_full)
+
+        fold_results = []
+        all_uncalibrated_spearmans = []
+        all_calibrated_spearmans = []
+        kmm_calibrator = None
+
+        if self.verbose:
+            print(f"\n[5/6] Running {n_folds}-fold experiment...")
+
+        for fold_idx, (train_index, test_index) in enumerate(fold_iterator):
+            if self.verbose:
+                print(f"\n{'='*70}\nFOLD {fold_idx + 1}/{n_folds}\n{'='*70}")
+
+            kmm_calibrator = SyntheticKMMCalibration(
+                kern=self.kmm_kern,
+                B=self.kmm_B,
+                eps=self.kmm_eps,
+                sigma=self.kmm_sigma,
+                max_real_ref=self.kmm_max_real_ref,
+                max_synth_ref=self.kmm_max_synth_ref,
+                random_state=CV_RANDOM_STATE + fold_idx,
+                verbose=self.verbose,
+                task_type=self.task_type,
+                loss_type=self.loss_type,
+            )
+
+            X_train_fold = X_full.iloc[train_index].reset_index(drop=True)
+            y_train_fold = y_full.iloc[train_index].reset_index(drop=True)
+            X_test_fold = X_full.iloc[test_index].reset_index(drop=True)
+            y_test_fold = y_full.iloc[test_index].reset_index(drop=True)
+
+            X_train_fold_proc, X_test_proc, y_train_fold_proc, y_test_proc, _ = self.data_loader.prepare_data(
+                X_train_fold, X_test_fold, y_train_fold, y_test_fold, task_type=self.task_type
+            )
+
+            if self.task_type == 'classification':
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc, test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx, stratify=y_train_fold_proc
+                )
+            else:
+                X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
+                    X_train_fold_proc, y_train_fold_proc, test_size=calib_test_ratio,
+                    random_state=CV_RANDOM_STATE + fold_idx
+                )
+
+            rng = np.random.RandomState(CV_RANDOM_STATE + fold_idx)
+            shuffled_architectures = all_architectures.copy()
+            rng.shuffle(shuffled_architectures)
+            architectures_M_train = shuffled_architectures[:M_calibration]
+            architectures_M_test = shuffled_architectures[M_calibration:]
+
+            fold_generator = self._train_generative_model_for_fold(
+                X_train_fold_proc, y_train_fold_proc,
+                use_cached_hyperparams=(self._best_hyperparams is not None)
+            )
+
+            n_synth = int(len(X_test_proc) * synth_size_multiplier)
+            X_synth, y_synth = fold_generator.generate(n_samples=n_synth)
+
+            if self.task_type == 'classification':
+                y_synth = y_synth.astype(int)
+            else:
+                y_synth = y_synth.astype(float)
+
+            # Fit KMM directly against the D_synth actually used for evaluation,
+            # so weight/loss vectors stay aligned (unlike density calibration,
+            # KMM needs no separate y_synth for weight computation).
+            kmm_calibrator.fit(X_real=X_test_calib, X_synth=X_synth)
+            fold_weights = kmm_calibrator.compute_weights_for_samples()
+
+            trained_m_test_models = [
+                self.model_selector.train_model(config, X_train_fold_proc, y_train_fold_proc)
+                for config in architectures_M_test
+            ]
+
+            fold_real_losses, fold_synth_losses, fold_calib_losses, fold_model_names = [], [], [], []
+            fold_per_sample_real, fold_per_sample_synth, fold_per_sample_calib = [], [], []
+
+            for config, model in zip(architectures_M_test, trained_m_test_models):
+                real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
+                synth_eval = self.model_selector.evaluate_model(model, X_synth, y_synth)
+                calib_loss = kmm_calibrator.evaluate_calibrated_loss(model, X_synth, y_synth)
+
+                fold_real_losses.append(real_eval['loss'])
+                fold_synth_losses.append(synth_eval['loss'])
+                fold_calib_losses.append(calib_loss)
+                fold_model_names.append(config.name)
+
+                per_sample_real = kmm_calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
+                per_sample_synth = kmm_calibrator._compute_sample_losses(model, X_synth, y_synth)
+                per_sample_calib = per_sample_synth * fold_weights  # weights sum to 1
+
+                fold_per_sample_real.append(per_sample_real)
+                fold_per_sample_synth.append(per_sample_synth)
+                fold_per_sample_calib.append(per_sample_calib)
+
+            fold_real_losses = np.array(fold_real_losses)
+            fold_synth_losses = np.array(fold_synth_losses)
+            fold_calib_losses = np.array(fold_calib_losses)
+
+            uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_spearman(fold_real_losses, fold_synth_losses)
+            calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(fold_real_losses, fold_calib_losses)
+
+            rank_analysis_uncalib = self.metrics.rank_preservation(fold_synth_losses, fold_real_losses)
+            rank_analysis_calib = self.metrics.rank_preservation(fold_calib_losses, fold_real_losses)
+
+            all_uncalibrated_spearmans.append(uncalib_spearman)
+            all_calibrated_spearmans.append(calib_spearman)
+
+            if self.verbose:
+                print(f"\n   Uncalibrated rho: {uncalib_spearman:.3f}")
+                print(f"   KMM-calibrated rho: {calib_spearman:.3f}")
+
+            fold_results.append({
+                'fold': fold_idx,
+                'model_names': fold_model_names,
+                'real_losses': fold_real_losses,
+                'synth_losses': fold_synth_losses,
+                'calibrated_synth_losses': fold_calib_losses,
+                'uncalibrated_spearman': uncalib_spearman,
+                'uncalibrated_pvalue': uncalib_pvalue,
+                'calibrated_spearman': calib_spearman,
+                'calibrated_pvalue': calib_pvalue,
+                'rank_analysis_uncalibrated': rank_analysis_uncalib,
+                'rank_analysis_calibrated': rank_analysis_calib,
+                'per_sample_real_losses': fold_per_sample_real,
+                'per_sample_synth_losses': fold_per_sample_synth,
+                'per_sample_calibrated_losses': fold_per_sample_calib,
+                'weights': fold_weights,
+            })
+
+        uncalib_stats = self.ci_estimator.aggregate_ci_from_samples(all_uncalibrated_spearmans)
+        calib_stats = self.ci_estimator.aggregate_ci_from_samples(all_calibrated_spearmans)
+
+        if self.verbose:
+            print(f"\n[6/6] Aggregating results across {n_folds} folds...")
+            print(f"Uncalibrated: {uncalib_stats['mean']:.3f} +/- {uncalib_stats['std']:.3f}")
+            print(f"KMM-calibrated: {calib_stats['mean']:.3f} +/- {calib_stats['std']:.3f}")
+
+        weight_decomposition = None
+        calibration_weights = kmm_calibrator.compute_weights_for_samples() if kmm_calibrator is not None else None
+
+        if analyze_shap and calibration_weights is not None and len(calibration_weights) > 0:
+            try:
+                self.analyze_calibration_weights_with_shap(
+                    X_synth=X_synth, calibration_weights=calibration_weights,
+                    plot_types=shap_plot_types, max_display=shap_max_display,
+                )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"   SHAP analysis skipped: {exc!r}")
+            try:
+                weight_decomposition = self.analyze_weight_decomposition(
+                    weights=calibration_weights, X_synth=X_synth,
+                )
+            except Exception as exc:
+                if self.verbose:
+                    print(f"   Weight decomposition skipped: {exc!r}")
+
+        self._last_kmm_calibrator = kmm_calibrator
+
+        return {
+            'dataset': self.dataset_name,
+            'synth_method': self.synth_method,
+            'task_type': self.task_type,
+            'M_calibration': M_calibration,
+            'n_evaluation_models': n_total_models - M_calibration,
+            'n_folds': n_folds,
+            'fold_results': fold_results,
+            'uncalibrated_stats': uncalib_stats,
+            'calibrated_stats': calib_stats,
+            'uncalibrated_spearmans': all_uncalibrated_spearmans,
+            'calibrated_spearmans': all_calibrated_spearmans,
+            'calibration_weights': calibration_weights,
+            'weight_decomposition': weight_decomposition,
+            'kmm_hyperparams': {'kern': self.kmm_kern, 'B': self.kmm_B, 'eps': self.kmm_eps, 'sigma': self.kmm_sigma},
+        }
 
     def run_kfold_bpr_calibration_experiment(self,
                                              n_folds: int = 5,
