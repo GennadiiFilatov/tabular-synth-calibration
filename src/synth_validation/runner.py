@@ -11,14 +11,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
 
-from .utils import RANDOM_SEED, CV_RANDOM_STATE
+from .utils import CV_RANDOM_STATE
 from .data_loader import DataLoader
 from .generation import SyntheticDataGenerator
-from .models import ModelSelectionFramework, ModelConfig
+from .models import ModelSelectionFramework
 from .confidence import ConfidenceIntervalEstimator
 from .metrics import EvaluationMetrics
 from .utility_decomposition import (
@@ -35,9 +35,8 @@ from .calibrator import (
     SyntheticKMMCalibration,
 )
 from .shap_analizer import SHAPWeightsAnalyzer
-from typing import Any, Optional, Union, List, Dict, Tuple, Callable
 from sklearn.base import clone
-from xgboost import XGBClassifier, XGBRegressor
+from xgboost import XGBClassifier
 
 
 class ExperimentRunner:
@@ -185,10 +184,115 @@ class ExperimentRunner:
         self.yreal = None
         self.xsynth = None
         self.ysynth = None
+
+    def _init_calibration_registry(self, calibration_methods: List[str]) -> Dict[str, Any]:
+        """
+        Create (once) and return a registry of calibrator instances, one per
+        requested calibration method, all sharing the same task_type/loss_type
+        and the hyperparameters already stored on `self` from __init__.
+
+        The registry is cached on `self._calibrator_registry` so that the same
+        Calibrator instances are reused and refit across folds.
+        """
+        if not hasattr(self, "_calibrator_registry") or self._calibrator_registry is None:
+            self._calibrator_registry = {}
+        registry = self._calibrator_registry
+
+        supported = {"constrained", "bpr", "density", "kmm"}
+        unknown = set(calibration_methods) - supported
+        if unknown:
+            raise ValueError(
+                f"Unknown calibration method(s) {sorted(unknown)}. "
+                f"Supported methods: {sorted(supported)}"
+            )
+
+        for method in calibration_methods:
+            if method in registry:
+                continue
+
+            if method == "constrained":
+                # Reuse the already-constructed constrained-QP calibrator so we
+                # don't silently create a second, differently-configured copy.
+                registry[method] = self.calibrator
+
+            elif method == "bpr":
+                registry[method] = SyntheticBPRCalibrator(
+                    eps=self.bpr_eps,
+                    beta=self.bpr_beta,
+                    lambda_reg=self.bpr_lambda_reg,
+                    mu=self.bpr_mu,
+                    tau=self.bpr_tau,
+                    rho=self.bpr_rho,
+                    verbose=self.verbose,
+                    task_type=self.task_type,
+                    loss_type=self.loss_type,
+                )
+
+            elif method == "density":
+                registry[method] = SyntheticDensityCalibration(
+                    method=self.density_method,
+                    xgb_n_estimators=self.density_xgb_n_estimators,
+                    xgb_max_depth=self.density_xgb_max_depth,
+                    xgb_learning_rate=self.density_xgb_learning_rate,
+                    xgb_subsample=self.density_xgb_subsample,
+                    xgb_colsample_bytree=self.density_xgb_colsample_bytree,
+                    xgb_reg_lambda=self.density_xgb_reg_lambda,
+                    xgb_reg_alpha=self.density_xgb_reg_alpha,
+                    xgb_tree_method=self.density_xgb_tree_method,
+                    xgb_n_jobs=self.density_xgb_n_jobs,
+                    random_state=self.density_random_state,
+                    verbose=self.verbose,
+                    task_type=self.task_type,
+                    loss_type=self.loss_type,
+                )
+
+            elif method == "kmm":
+                registry[method] = SyntheticKMMCalibration(
+                    kern=self.kmm_kern,
+                    B=self.kmm_B,
+                    eps=self.kmm_eps,
+                    sigma=self.kmm_sigma,
+                    max_real_ref=self.kmm_max_real_ref,
+                    max_synth_ref=self.kmm_max_synth_ref,
+                    verbose=self.verbose,
+                    task_type=self.task_type,
+                    loss_type=self.loss_type,
+                )
+
+        return registry
+
+    def _fit_calibrator_for_method(
+        self,
+        method: str,
+        calibrator: Any,
+        calibration_models: List[Any],
+        X_synth: pd.DataFrame,
+        y_synth: pd.Series,
+        X_real_val: pd.DataFrame,
+        y_real_val: pd.Series,
+    ) -> None:
+        """
+        Dispatch `.fit(...)` with the argument signature appropriate for the
+        given calibration method, on IDENTICAL inputs (same M_train models,
+        same X_synth/y_synth, same X_real_val/y_real_val) so that all methods
+        use the same model and data inputs within a fold.
+        """
+        if method in ("constrained", "bpr"):
+            calibrator.fit(
+                calibration_models=calibration_models,
+                X_synth=X_synth,
+                y_synth=y_synth,
+                X_real_val=X_real_val,
+                y_real_val=y_real_val,
+            )
+        elif method in ("density", "kmm"):
+            # These two methods calibrate purely on covariates (no model losses).
+            calibrator.fit(X_real=X_real_val, X_synth=X_synth)
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
     
     def _setup_figures_dir(self):
         """Create figures directory with timestamp."""
-        from pathlib import Path
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         if self.figures_dir is None:
             self.figures_dir = f"./experiment_figures/{self.dataset_name}_{self.synth_method}_{timestamp}"
@@ -608,8 +712,6 @@ class ExperimentRunner:
             fold_per_sample_synth = []
             fold_per_sample_calib = []
 
-            weights_for_samples = self.calibrator.compute_weights_for_samples(y_synth)
-            
             for config, model in zip(architectures_M_test, trained_m_test_models):
                 real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
                 synth_eval = self.model_selector.evaluate_model(model, X_synth, y_synth)
@@ -766,18 +868,19 @@ class ExperimentRunner:
         return self.results
     
     def run_kfold_calibration_experiment(self,
-                                          n_folds: int = 5,
-                                          M_calibration: int = 10,
-                                          synth_size_multiplier: float = 1.0,
-                                          calib_test_ratio: float = 0.2,
-                                          tune_synthetic: bool = False,
-                                          n_tune_trials: int = 40,
-                                          analyze_shap: bool = True,
-                                          shap_plot_types: List[str] = ["dot"],
-                                          shap_max_display: int = 15) -> Dict:
+                                              n_folds: int = 5,
+                                              M_calibration: int = 10,
+                                              synth_size_multiplier: float = 1.0,
+                                              calib_test_ratio: float = 0.2,
+                                              tune_synthetic: bool = False,
+                                              n_tune_trials: int = 40,
+                                              analyze_shap: bool = True,
+                                              shap_plot_types: List[str] = ["dot"],
+                                              shap_max_display: int = 15,
+                                              calibration_methods: Optional[List[str]] = None) -> Dict:
         """
         Main experiment pipeline with K-fold cross-validation.
-        
+
         Pipeline for each fold:
 
         1. Split data: D_train (fold train), D_test (fold test)
@@ -787,9 +890,13 @@ class ExperimentRunner:
         5. Split all architectures -> M_train (calibration), M_test (evaluation)
         6. Train M_train and M_test models on D_train_calib
         7. Generate D_synth_test (size = len(D_test))
-        8. Compute losses for M_train on D_test_calib, train calibrator
-        9. For M_test: compute losses on D_test, D_synth (uncalibrated), D_synth (calibrated)
-        10. Compute Spearman correlation for uncalibrated and calibrated rankings
+        8. For EVERY calibration method in `calibration_methods`, fit a
+            calibrator on the SAME M_train models / D_synth / D_test_calib and
+            compute its own weight vector over D_synth.
+        9. For M_test: compute losses on D_test, D_synth (uncalibrated), and
+            D_synth (calibrated) UNDER EACH calibration method.
+        10. Compute all reported ranking metrics against D_test (the outer
+            evaluation set) for uncalibrated and each calibrated ranking.
 
         Args:
             n_folds: Number of cross-validation folds
@@ -801,10 +908,28 @@ class ExperimentRunner:
             analyze_shap: Whether to perform SHAP analysis
             shap_plot_types: SHAP plot types
             shap_max_display: Max features for SHAP plots
-            
+            calibration_methods: Which calibration methods to fit and compare
+                in this single run. Subset of {"constrained", "bpr", "density",
+                "kmm"}. Defaults to all four. All methods reuse exactly the
+                same M_train models, D_synth and D_test_calib within a fold,
+                so their resulting weight vectors are directly comparable.
+                (PPI is intentionally excluded here: it estimates a scalar
+                risk via cross-fitting rather than a per-sample weight vector,
+                so it is not compatible with this "same-samples/same-models,
+                per-method weights" comparison and is exposed elsewhere.)
+
         Returns:
-            Dictionary with comprehensive experiment results
+            Dictionary with comprehensive experiment results, including a
+            per-method breakdown under `results['calibration_methods']` and
+            backward-compatible top-level fields mirroring the FIRST method
+            in `calibration_methods` (default: "constrained").
         """
+        if calibration_methods is None:
+            calibration_methods = ["constrained", "bpr", "density", "kmm"]
+        if len(calibration_methods) == 0:
+            raise ValueError("calibration_methods must contain at least one method.")
+        primary_method = calibration_methods[0]
+
         # ============================================================
         # [1] LOAD RAW DATA
         # ============================================================
@@ -813,9 +938,10 @@ class ExperimentRunner:
             print("K-FOLD CALIBRATION EXPERIMENT")
             print("="*80)
             print(f"\n[1/6] Loading dataset: {self.dataset_name}...")
-        
+            print(f"   Calibration methods to fit this run: {calibration_methods}")
+
         df = self.data_loader.load_uci_dataset(self.dataset_name)
-        
+
         target_col = None
         for col in ['income', 'target', 'class']:
             if col in df.columns:
@@ -823,20 +949,20 @@ class ExperimentRunner:
                 break
         if target_col is None:
             target_col = df.columns[-1]
-        
+
         X_full = df.drop(columns=[target_col]).copy()
         y_full = df[target_col].copy()
-        
+
         if self.verbose:
             print(f"   Samples: {len(X_full)}, Features: {X_full.shape[1]}")
-        
+
         # ============================================================
         # [2] OPTIONAL: TUNE GAN ON REFERENCE SPLIT
         # ============================================================
         if tune_synthetic and self._synthesizer is None:
             if self.verbose:
                 print(f"\n[2/6] Tuning GAN hyperparameters...")
-            
+
             if self.task_type == 'classification':
                 X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
                     X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE, stratify=y_full
@@ -845,21 +971,21 @@ class ExperimentRunner:
                 X_ref_train, X_ref_test, y_ref_train, y_ref_test = train_test_split(
                     X_full, y_full, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
                 )
-            
+
             X_ref_train_proc, _, y_ref_train_proc, _, _ = self.data_loader.prepare_data(
                 X_ref_train, X_ref_test, y_ref_train, y_ref_test, task_type=self.task_type
             )
 
             if self.task_type == 'classification':
                 X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
-                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio, 
+                    X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio,
                     random_state=CV_RANDOM_STATE, stratify=y_ref_train_proc
                 )
             else:
                 X_ref_train_proc, X_ref_val_proc, y_ref_train_proc, y_ref_val_proc = train_test_split(
                     X_ref_train_proc, y_ref_train_proc, test_size=calib_test_ratio, random_state=CV_RANDOM_STATE
                 )
-            
+
             ref_generator = SyntheticDataGenerator(method=self.synth_method, task_type=self.task_type)
             ref_generator.fit(
                 X_train=X_ref_train_proc,
@@ -871,61 +997,65 @@ class ExperimentRunner:
                 quality_metric='swd',
                 verbose=self.verbose
             )
-            
+
             self._best_hyperparams = ref_generator.best_hyperparams
             self._synthesizer = ref_generator.synthesizer
             self._synth_generator = ref_generator
-            
+
             if self.verbose:
                 print(f"   Best hyperparameters: {self._best_hyperparams}")
         else:
             if self.verbose:
                 print(f"\n[2/6] Skipping GAN tuning")
-        
+
         # ============================================================
         # [3] GET ALL MODEL ARCHITECTURES
         # ============================================================
         if self.verbose:
             print(f"\n[3/6] Setting up model architectures...")
-        
+
         all_architectures = self.model_selector.get_model_architectures()
         n_total_models = len(all_architectures)
-        
+
         if M_calibration >= n_total_models:
             raise ValueError(f"M_calibration ({M_calibration}) must be < total architectures ({n_total_models})")
-        
+
         if self.verbose:
             print(f"   Total: {n_total_models}, M_train: {M_calibration}, M_test: {n_total_models - M_calibration}")
-        
+
         # ============================================================
         # [4] SETUP K-FOLD CROSS-VALIDATION
         # ============================================================
         if self.verbose:
             print(f"\n[4/6] Setting up {n_folds}-fold cross-validation...")
-        
+
         if self.task_type == 'classification':
             kfold = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
             fold_iterator = kfold.split(X_full, y_full)
         else:
             kfold = KFold(n_splits=n_folds, shuffle=True, random_state=CV_RANDOM_STATE)
             fold_iterator = kfold.split(X_full)
-        
+
         fold_results = []
+        # Per-method accumulators for the Spearman correlations across folds.
         all_uncalibrated_spearmans = []
-        all_calibrated_spearmans = []
-        
+        all_calibrated_spearmans_by_method = {m: [] for m in calibration_methods}
+
+        # Build (once) the registry of calibrator instances for all requested methods.
+        calibrator_registry = self._init_calibration_registry(calibration_methods)
+
         # ============================================================
         # [5] RUN EXPERIMENT FOR EACH FOLD
         # ============================================================
         if self.verbose:
             print(f"\n[5/6] Running {n_folds}-fold experiment...")
-        
+
         for fold_idx, (train_index, test_index) in enumerate(fold_iterator):
             if self.verbose:
                 print(f"\n{'='*70}")
                 print(f"FOLD {fold_idx + 1}/{n_folds}")
                 print(f"{'='*70}")
-            
+
             # Split data
             X_train_fold = X_full.iloc[train_index].reset_index(drop=True)
             y_train_fold = y_full.iloc[train_index].reset_index(drop=True)
@@ -939,7 +1069,7 @@ class ExperimentRunner:
             if self.verbose:
                 print(f"   D_train size: {len(X_train_fold_proc)}")
                 print(f"   D_test size: {len(X_test_proc)}")
-            
+
             # Split for calibration
             if self.task_type == 'classification':
                 X_train_calib, X_test_calib, y_train_calib, y_test_calib = train_test_split(
@@ -954,113 +1084,144 @@ class ExperimentRunner:
                     test_size=calib_test_ratio,
                     random_state=CV_RANDOM_STATE + fold_idx
                 )
-            
+
             # Split architectures
             rng = np.random.RandomState(CV_RANDOM_STATE + fold_idx)
             shuffled_architectures = all_architectures.copy()
             rng.shuffle(shuffled_architectures)
-            
+
             architectures_M_train = shuffled_architectures[:M_calibration]
             architectures_M_test = shuffled_architectures[M_calibration:]
 
             m_train_names = [a.name for a in architectures_M_train]
             m_test_names = [a.name for a in architectures_M_test]
-            
+
             if self.verbose:
                 print(f"   M_train models: {m_train_names[:3]}... ({len(m_train_names)} total)")
                 print(f"   M_test models: {m_test_names[:3]}... ({len(m_test_names)} total)")
-            
+
             # Train generative model
             if self.verbose:
                 print(f"   Training {self.synth_method}...")
-            
+
             fold_generator = self._train_generative_model_for_fold(
                 X_train_fold_proc, y_train_fold_proc,
                 use_cached_hyperparams=(self._best_hyperparams is not None)
             )
-            
-            # Generate synthetic data
+
+            # Generate synthetic data (ONE draw, shared by every calibration method)
             n_synth = int(len(X_test_proc) * synth_size_multiplier)
             X_synth, y_synth = fold_generator.generate(n_samples=n_synth)
-            
+
             if self.task_type == 'classification':
                 y_synth = y_synth.astype(int)
             else:
                 y_synth = y_synth.astype(float)
-            
-            # Train M_train models
+
+            # Train M_train models (shared by every calibration method)
             trained_m_train_models = []
             for config in architectures_M_train:
                 model = self.model_selector.train_model(config, X_train_calib, y_train_calib)
                 trained_m_train_models.append(model)
-            
-            # Fit calibrator
-            self.calibrator.fit(
-                calibration_models=trained_m_train_models,
-                X_synth=X_synth,
-                y_synth=y_synth,
-                X_real_val=X_test_calib,
-                y_real_val=y_test_calib
-            )
-            
+
+            # --------------------------------------------------------
+            # Fit EVERY requested calibration method on the SAME
+            # trained_m_train_models / X_synth / y_synth / X_test_calib / y_test_calib
+            # --------------------------------------------------------
+            for method in calibration_methods:
+                self._fit_calibrator_for_method(
+                    method=method,
+                    calibrator=calibrator_registry[method],
+                    calibration_models=trained_m_train_models,
+                    X_synth=X_synth,
+                    y_synth=y_synth,
+                    X_real_val=X_test_calib,
+                    y_real_val=y_test_calib,
+                )
+
             # Train M_test models
             trained_m_test_models = []
             for config in architectures_M_test:
                 model = self.model_selector.train_model(config, X_train_fold_proc, y_train_fold_proc)
                 trained_m_test_models.append(model)
-            
-            # Compute losses
+
+            # Compute uncalibrated losses ONCE per model (method-independent)
             fold_real_losses = []
             fold_synth_losses = []
-            fold_calib_losses = []
             fold_model_names = []
-
             fold_per_sample_real = []
             fold_per_sample_synth = []
-            fold_per_sample_calib = []
-            
+
+            # Per-method containers
+            fold_calib_losses_by_method = {m: [] for m in calibration_methods}
+            fold_per_sample_calib_by_method = {m: [] for m in calibration_methods}
+
             for config, model in zip(architectures_M_test, trained_m_test_models):
                 real_eval = self.model_selector.evaluate_model(model, X_test_proc, y_test_proc)
                 synth_eval = self.model_selector.evaluate_model(model, X_synth, y_synth)
-                calib_loss = self.calibrator.evaluate_calibrated_loss(model, X_synth, y_synth)
-                
+
                 fold_real_losses.append(real_eval['loss'])
                 fold_synth_losses.append(synth_eval['loss'])
-                fold_calib_losses.append(calib_loss)
                 fold_model_names.append(config.name)
 
-                per_sample_real = self.calibrator._compute_sample_losses(model, X_test_proc, y_test_proc)
-                per_sample_synth = self.calibrator._compute_sample_losses(model, X_synth, y_synth)
-                per_sample_calib = per_sample_synth * self.calibrator.weights * n_synth
+                per_sample_real = calibrator_registry[primary_method]._compute_sample_losses(model, X_test_proc, y_test_proc) \
+                    if hasattr(calibrator_registry[primary_method], "_compute_sample_losses") \
+                    else calibrator_registry[primary_method].compute_sample_losses(model, X_test_proc, y_test_proc)
+                per_sample_synth = calibrator_registry[primary_method]._compute_sample_losses(model, X_synth, y_synth) \
+                    if hasattr(calibrator_registry[primary_method], "_compute_sample_losses") \
+                    else calibrator_registry[primary_method].compute_sample_losses(model, X_synth, y_synth)
 
                 fold_per_sample_real.append(per_sample_real)
                 fold_per_sample_synth.append(per_sample_synth)
-                fold_per_sample_calib.append(per_sample_calib)
-            
+
+                for method in calibration_methods:
+                    calib = calibrator_registry[method]
+                    calib_loss = calib.evaluate_calibrated_loss(model, X_synth, y_synth)
+                    fold_calib_losses_by_method[method].append(calib_loss)
+
+                    method_weights = calib.compute_weights_for_samples(y_synth)
+                    fold_per_sample_calib_by_method[method].append(per_sample_synth * method_weights * n_synth)
+
             fold_real_losses = np.array(fold_real_losses)
             fold_synth_losses = np.array(fold_synth_losses)
-            fold_calib_losses = np.array(fold_calib_losses)
-            
-            # Compute correlations
+
+            # Compute correlations (uncalibrated, once) and per-method (calibrated)
             uncalib_spearman, uncalib_pvalue = self.ci_estimator.compute_spearman(
                 fold_real_losses, fold_synth_losses
             )
-            calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(
-                fold_real_losses, fold_calib_losses
-            )
-            
             all_uncalibrated_spearmans.append(uncalib_spearman)
-            all_calibrated_spearmans.append(calib_spearman)
 
-                        # Rank preservation analysis
             rank_analysis_uncalib = self.metrics.compute_rank_preservation_with_guarantees(
                 fold_real_losses, fold_synth_losses
             )
-            rank_analysis_calib = self.metrics.compute_rank_preservation_with_guarantees(
-                fold_real_losses, fold_calib_losses
-            )
-            
-            # Store fold results
+
+            calibration_methods_fold_result = {}
+            for method in calibration_methods:
+                fold_calib_losses = np.array(fold_calib_losses_by_method[method])
+                calib_spearman, calib_pvalue = self.ci_estimator.compute_spearman(
+                    fold_real_losses, fold_calib_losses
+                )
+                all_calibrated_spearmans_by_method[method].append(calib_spearman)
+
+                rank_analysis_calib = self.metrics.compute_rank_preservation_with_guarantees(
+                    fold_real_losses, fold_calib_losses
+                )
+
+                calibration_methods_fold_result[method] = {
+                    'calibrated_synth_losses': fold_calib_losses,
+                    'calibrated_spearman': calib_spearman,
+                    'calibrated_pvalue': calib_pvalue,
+                    'rank_analysis_calibrated': rank_analysis_calib,
+                    'per_sample_calibrated_losses': fold_per_sample_calib_by_method[method],
+                    'weights': calibrator_registry[method].compute_weights_for_samples(y_synth),
+                }
+
+                if self.verbose:
+                    print(f"   [{method}] Calibrated \u03c1: {calib_spearman:.3f} "
+                            f"({calib_spearman - uncalib_spearman:+.3f})")
+
+            # Store fold results (backward-compatible top-level fields mirror `primary_method`)
+            primary = calibration_methods_fold_result[primary_method]
             fold_result = {
                 'fold': fold_idx + 1,
                 'n_train_calib': len(X_train_calib),
@@ -1071,100 +1232,120 @@ class ExperimentRunner:
                 'm_test_architectures': m_test_names,
                 'real_losses': fold_real_losses,
                 'synth_losses': fold_synth_losses,
-                'calibrated_synth_losses': fold_calib_losses,
-                'uncalibrated_spearman': uncalib_spearman,
-                'uncalibrated_pvalue': uncalib_pvalue,
-                'calibrated_spearman': calib_spearman,
-                'calibrated_pvalue': calib_pvalue,
-                'rank_analysis_uncalibrated': rank_analysis_uncalib,
-                'rank_analysis_calibrated': rank_analysis_calib,
                 'model_names': fold_model_names,
                 'per_sample_real_losses': fold_per_sample_real,
                 'per_sample_synth_losses': fold_per_sample_synth,
-                'per_sample_calibrated_losses': fold_per_sample_calib,
-                'weights': self.calibrator.compute_weights_for_samples(y_synth)
+                'uncalibrated_spearman': uncalib_spearman,
+                'uncalibrated_pvalue': uncalib_pvalue,
+                'rank_analysis_uncalibrated': rank_analysis_uncalib,
+                # Per-method breakdown: weights/losses/correlations for ALL methods fit this run.
+                'calibration_methods': calibration_methods_fold_result,
+                # Backward-compatible aliases (mirror the primary/default method).
+                'calibrated_synth_losses': primary['calibrated_synth_losses'],
+                'calibrated_spearman': primary['calibrated_spearman'],
+                'calibrated_pvalue': primary['calibrated_pvalue'],
+                'rank_analysis_calibrated': primary['rank_analysis_calibrated'],
+                'per_sample_calibrated_losses': primary['per_sample_calibrated_losses'],
+                'weights': primary['weights'],
             }
             fold_results.append(fold_result)
-            
+
             if self.verbose:
-                print(f"\n   Uncalibrated ρ: {uncalib_spearman:.3f}")
-                print(f"   Calibrated ρ:   {calib_spearman:.3f} ({calib_spearman - uncalib_spearman:+.3f})")
-        
+                print(f"\n   Uncalibrated \u03c1: {uncalib_spearman:.3f}")
+
         # ============================================================
         # [6] AGGREGATE RESULTS
         # ============================================================
         if self.verbose:
             print(f"\n[6/6] Computing aggregate statistics...")
-        
+
         uncalib_stats = self.ci_estimator.aggregate_ci_from_samples(all_uncalibrated_spearmans)
-        calib_stats = self.ci_estimator.aggregate_ci_from_samples(all_calibrated_spearmans)
-        
+
+        calib_stats_by_method = {}
+        for method in calibration_methods:
+            calib_stats_by_method[method] = self.ci_estimator.aggregate_ci_from_samples(
+                all_calibrated_spearmans_by_method[method]
+            )
+
         if self.verbose:
             print(f"\n{'='*80}")
             print(f"AGGREGATE RESULTS ({n_folds} folds)")
             print(f"{'='*80}")
-            print(f"Uncalibrated: {uncalib_stats['mean']:.3f} ± {uncalib_stats['std']:.3f}")
+            print(f"Uncalibrated: {uncalib_stats['mean']:.3f} \u00b1 {uncalib_stats['std']:.3f}")
             print(f"  95% CI: [{uncalib_stats['ci_lower']:.3f}, {uncalib_stats['ci_upper']:.3f}]")
-            print(f"Calibrated:   {calib_stats['mean']:.3f} ± {calib_stats['std']:.3f}")
-            print(f"  95% CI: [{calib_stats['ci_lower']:.3f}, {calib_stats['ci_upper']:.3f}]")
-        
-        # Cache data
-        self.xreal = X_test_proc
-        self.yreal = y_test_proc
-        self.xsynth = X_synth
-        self.ysynth = y_synth
+            for method in calibration_methods:
+                s = calib_stats_by_method[method]
+                print(f"[{method}] Calibrated:   {s['mean']:.3f} \u00b1 {s['std']:.3f}")
+                print(f"  95% CI: [{s['ci_lower']:.3f}, {s['ci_upper']:.3f}]")
+
+        # Cache data (last fold, same convention as before the fix)
+        self.X_real = X_test_proc
+        self.y_real = y_test_proc
+        self.X_synth = X_synth
+        self.y_synth = y_synth
         self._synth_data_cached = (X_synth, y_synth)
 
         if self._synthesizer is None and fold_generator is not None:
-            # Store the underlying synthesizer for SDK methods (CTGAN, TVAE, GaussianCopula)
             if hasattr(fold_generator, 'synthesizer') and fold_generator.synthesizer is not None:
                 self._synthesizer = fold_generator.synthesizer
-            # For TabPFGen, store the generator itself
             elif hasattr(fold_generator, '_tabpfgen') and fold_generator._tabpfgen is not None:
                 self._synthesizer = fold_generator
-            # For TabDDPM, store the plugin
             elif hasattr(fold_generator, '_tabddpm_plugin') and fold_generator._tabddpm_plugin is not None:
                 self._synthesizer = fold_generator
             else:
-                # Fallback: store the whole generator
                 self._synthesizer = fold_generator
             self._synth_generator = fold_generator
 
         def _fit_cross_fitted_eta(X, y, X_eval, task_type="classification",
-                                   n_splits=5, base_estimator=None, random_state=None):
-                X_arr = X.values if hasattr(X, "values") else np.asarray(X)
-                y_arr = y.values if hasattr(y, "values") else np.asarray(y)
-                X_eval_arr = X_eval.values if hasattr(X_eval, "values") else np.asarray(X_eval)
-        
-                if base_estimator is None:
-                    base_estimator = XGBClassifier(
-                        n_estimators=300, max_depth=5, learning_rate=0.1,
-                        tree_method="hist", n_jobs=-1, verbosity=0
-                    )
-        
-                splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-                fold_preds = []
-        
-                for train_idx, _ in splitter.split(X_arr, y_arr):
-                    model = clone(base_estimator)
-                    model.fit(X_arr[train_idx], y_arr[train_idx])
-                    pred = model.predict_proba(X_eval_arr)[:, 1]
-                    fold_preds.append(pred)
-        
-                return np.mean(np.stack(fold_preds, axis=0), axis=0)
-        
-        # SHAP analysis
-        shap_analyzer = None
-        weight_decomposition = None
-        calibration_weights = None
-        if analyze_shap and self._synth_data_cached is not None:
-            calibration_weights = self.calibrator.compute_weights_for_samples(y_synth)
-            
-            if calibration_weights is not None and len(calibration_weights) > 0:
+                                    n_splits=5, base_estimator=None, random_state=None):
+            X_arr = X.values if hasattr(X, "values") else np.asarray(X)
+            y_arr = y.values if hasattr(y, "values") else np.asarray(y)
+            X_eval_arr = X_eval.values if hasattr(X_eval, "values") else np.asarray(X_eval)
 
+            if base_estimator is None:
+                base_estimator = XGBClassifier(
+                    n_estimators=300, max_depth=5, learning_rate=0.1,
+                    tree_method="hist", n_jobs=-1, verbosity=0
+                )
+
+            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            fold_preds = []
+
+            for train_idx, _ in splitter.split(X_arr, y_arr):
+                model = clone(base_estimator)
+                model.fit(X_arr[train_idx], y_arr[train_idx])
+                pred = model.predict_proba(X_eval_arr)[:, 1]
+                fold_preds.append(pred)
+
+            return np.mean(np.stack(fold_preds, axis=0), axis=0)
+
+        # SHAP analysis + weight decomposition, run PER METHOD on the last fold's cached data
+        shap_analyzer_by_method = {}
+        weight_decomposition_by_method = {}
+
+        # Oracle predictions are method-independent, so compute them only once.
+        oracle_real_preds = None
+        oracle_synth_preds = None
+        if self._synth_data_cached is not None:
+            oracle_real_probs = _fit_cross_fitted_eta(
+                X=X_train_calib, y=y_train_calib, X_eval=X_synth,
+                task_type=self.task_type, random_state=CV_RANDOM_STATE + fold_idx,
+            )
+            oracle_real_preds = (oracle_real_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_real_probs
+
+            oracle_synth_probs = _fit_cross_fitted_eta(
+                X=X_synth, y=y_synth, X_eval=X_synth,
+                task_type=self.task_type, random_state=CV_RANDOM_STATE + fold_idx,
+            )
+            oracle_synth_preds = (oracle_synth_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_synth_probs
+
+        for method in calibration_methods:
+            calib = calibrator_registry[method]
+            calibration_weights = calib.compute_weights_for_samples(y_synth)
+
+            if analyze_shap and self._synth_data_cached is not None and calibration_weights is not None and len(calibration_weights) > 0:
                 y_real_values = y_test_proc.values if hasattr(y_test_proc, 'values') else np.array(y_test_proc)
-                
-                shap_analyzer = self.analyze_calibration_weights_with_shap(
+                shap_analyzer_by_method[method] = self.analyze_calibration_weights_with_shap(
                     X_synth=X_synth,
                     y_synth=y_synth,
                     calibration_weights=calibration_weights,
@@ -1175,37 +1356,18 @@ class ExperimentRunner:
                     verbose=self.verbose
                 )
 
-        if calibration_weights is not None and len(calibration_weights) > 0:
-
-            oracle_real_probs = _fit_cross_fitted_eta(
-                X=X_train_calib,
-                y=y_train_calib,
-                X_eval=X_synth,
-                task_type=self.task_type,
-                random_state=CV_RANDOM_STATE + fold_idx,
-            )
-            oracle_real_preds = (oracle_real_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_real_probs
-
-            oracle_synth_probs = _fit_cross_fitted_eta(
-                X=X_synth,
-                y=y_synth,
-                X_eval=X_synth,
-                task_type=self.task_type,
-                random_state=CV_RANDOM_STATE + fold_idx,
-            )
-            oracle_synth_preds = (oracle_synth_probs >= 0.5).astype(int) if self.task_type == 'classification' else oracle_synth_probs
-
-            weight_decomposition = self.analyze_weight_decomposition(
-                weights=calibration_weights,
-                X_synth=X_synth,
-                y_synth=y_synth,
-                X_real=X_test_calib,
-                y_real=y_test_calib,
-                eval_models=trained_m_test_models,
-                oracle_real_preds=oracle_real_preds,
-                oracle_synth_preds=oracle_synth_preds,
-                verbose=self.verbose,
-            )
+            if calibration_weights is not None and len(calibration_weights) > 0 and oracle_real_preds is not None:
+                weight_decomposition_by_method[method] = self.analyze_weight_decomposition(
+                    weights=calibration_weights,
+                    X_synth=X_synth,
+                    y_synth=y_synth,
+                    X_real=X_test_calib,
+                    y_real=y_test_calib,
+                    eval_models=trained_m_test_models,
+                    oracle_real_preds=oracle_real_preds,
+                    oracle_synth_preds=oracle_synth_preds,
+                    verbose=self.verbose,
+                )
 
         self.results = {
             'dataset': self.dataset_name,
@@ -1214,21 +1376,28 @@ class ExperimentRunner:
             'n_folds': n_folds,
             'M_calibration': M_calibration,
             'n_evaluation_models': n_total_models - M_calibration,
+            'calibration_methods_used': calibration_methods,
             'fold_results': fold_results,
             'iteration_results': fold_results,
             'uncalibrated_stats': uncalib_stats,
-            'calibrated_stats': calib_stats,
             'uncalibrated_spearmans': all_uncalibrated_spearmans,
-            'calibrated_spearmans': all_calibrated_spearmans,
-            'shap_analyzer': shap_analyzer,
-            'weight_decomposition': weight_decomposition
+            # Per-method aggregate stats/correlations, plus SHAP/weight-decomposition per method.
+            'calibration_methods_stats': calib_stats_by_method,
+            'calibration_methods_spearmans': all_calibrated_spearmans_by_method,
+            'shap_analyzer_by_method': shap_analyzer_by_method,
+            'weight_decomposition_by_method': weight_decomposition_by_method,
+            # Backward-compatible top-level aliases (mirror the primary/default method).
+            'calibrated_stats': calib_stats_by_method[primary_method],
+            'calibrated_spearmans': all_calibrated_spearmans_by_method[primary_method],
+            'shap_analyzer': shap_analyzer_by_method.get(primary_method),
+            'weight_decomposition': weight_decomposition_by_method.get(primary_method),
         }
-        
+
         if self.verbose:
             print(f"\n{'='*80}")
             print("EXPERIMENT COMPLETE!")
             print(f"{'='*80}")
-        
+
         return self.results
 
     def _select_diverse_calibration_models(
@@ -1251,11 +1420,11 @@ class ExperimentRunner:
         n_total = len(trained_models)
         M = min(M_calibration, n_total)
 
-        # Работаем только с уникальными значениями лоссов
+            # Use one representative for each distinct loss value.
         sorted_indices = np.argsort(all_losses)
         sorted_losses  = all_losses[sorted_indices]
 
-        # Убрать дубликаты по значению: оставить первое вхождение каждого уникального лосса
+            # Keep the first model for each unique loss.
         unique_mask = np.concatenate([[True], np.diff(sorted_losses) > 1e-9])
         unique_sorted_indices = sorted_indices[unique_mask]
         unique_sorted_losses  = sorted_losses[unique_mask]
@@ -1311,8 +1480,7 @@ class ExperimentRunner:
                             valid = False
                             break
 
-                        # Отклонение snap от цели не должно превышать половину шага
-                        # — иначе это не равноудалённость, а произвол
+                        # Reject targets that are too far from any loss value.
                         if abs(unique_sorted_losses[best_pos] - t) > step * 0.5 + 1e-9:
                             valid = False
                             break
@@ -3329,10 +3497,12 @@ class ExperimentRunner:
         if self.task_type == 'classification':
             if method_name == 'linear':
                 return {
-                    'LogReg_L2_LBFGS', 'LogReg_L1_SAGA', 'LogReg_ElasticNet',
-                    'LogReg_L2_LBFGS_CV', 'LogReg_None', 'SGD_Log_Loss',
-                    'Calibrated_LinearSVC', 'Calibrated_SGD_Hinge', 'Calibrated_LinearSVC_Isotonic',
-                    'SVC_Linear', 'LDA_SVD'
+                    'LogReg_L2_C0p01', 'LogReg_L2_C0p1', 'LogReg_L2_C1',
+                    'LogReg_L2_C10', 'LogReg_L1_C0p1', 'LogReg_L1_C1',
+                    'LogReg_L1_C10', 'LogReg_Elastic_C0p1', 'LogReg_Elastic_C1',
+                    'LogReg_Elastic_C10', 'SGD_LogLoss_Alpha1e-5',
+                    'SGD_LogLoss_Alpha1e-4', 'SGD_LogLoss_Alpha1e-3',
+                    'SGD_LogLoss_L1', 'SGD_LogLoss_Elastic'
                 }
             elif method_name == 'ensemble':
                 return {
@@ -3376,9 +3546,11 @@ class ExperimentRunner:
         else:  # regression
             if method_name == 'linear':
                 return {
-                    'LinearRegression', 'Ridge_Alpha1', 'Ridge_Alpha10', 'Ridge_Alpha01',
-                    'Lasso_Alpha1', 'Lasso_Alpha01', 'ElasticNet_L1_05', 'ElasticNet_L1_02',
-                    'SGD_L2', 'SGD_L1', 'SGD_Huber', 'SVR_Linear'
+                    'LinearRegression', 'Ridge_Alpha0p01', 'Ridge_Alpha0p1',
+                    'Ridge_Alpha1', 'Ridge_Alpha10', 'Ridge_Alpha100',
+                    'Ridge_Alpha1000', 'Lasso_Alpha0p0001', 'Lasso_Alpha0p001',
+                    'Lasso_Alpha0p01', 'Lasso_Alpha0p1', 'ElasticNet_Alpha0p001',
+                    'ElasticNet_Alpha0p01', 'ElasticNet_Alpha0p1', 'ElasticNet_Alpha1'
                 }
             elif method_name == 'svm':
                 return {
