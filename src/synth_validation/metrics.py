@@ -21,37 +21,19 @@ diagnostics"):
     rho_cal             - Spearman correlation between synthetic and uniform
                           real losses on Hcal (secondary diagnostic).
 
-Also retains the theoretical rank-preservation bound from [1]
-(compute_rank_preservation_with_guarantees, Corollary 3.3) and NDCG@k, since
-both are used downstream by the runner and are not redundant with the plan's
-metric set.
-
-Removed relative to the previous version (redundant / superseded):
-    - compute_selection_accuracy: precision_at_k and recall_at_k were
-      mathematically identical (both computed as
-      |top_k_synth & top_k_test| / k), making f1_at_k a redundant restatement
-      of hit_rate_at_k / topk_metrics. Its unique content (regret,
-      relative_regret) is superseded by the plan's proper Reg@1 / NormReg@1.
-    - rank_preservation's per-k `top_{k}_overlap` / `top_{k}_overlap_pct`
-      entries: exact duplicates of hit_rate_at_k / topk_metrics; kept only
-      the non-duplicated content of that method (kendall tau, mean absolute
-      rank difference, best-model agreement).
-    - plot_topk_overlap's inline overlap computation: now delegates to
-      hit_rate_at_k instead of recomputing the same top-k set intersection.
+The module also provides the theoretical rank-preservation bound and NDCG@k.
 """
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
-from typing import Dict, List, Optional, Tuple, Union, Callable, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class EvaluationMetrics:
     """
     Evaluation metrics for synthetic-data-based model ranking/selection,
-    aligned with the semester research plan's metric table (Section 3) and
-    WP3 deployment-time diagnostics.
+    for synthetic-data model selection and deployment diagnostics.
     """
 
     def __init__(self):
@@ -62,21 +44,36 @@ class EvaluationMetrics:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def spearman_correlation(losses_synth: np.ndarray,
-                              losses_test: np.ndarray,
+    def spearman_correlation(losses_synth_eval: np.ndarray,
+                              losses_real_eval: np.ndarray,
                               alternative: str = 'two-sided') -> Dict[str, float]:
         """
-        Spearman rank correlation between synthetic and real losses.
-        Used directly as rho_cal (Section 3, "secondary" diagnostic) when
-        applied to Hcal.
-        """
-        losses_synth = np.asarray(losses_synth, dtype=float)
-        losses_test = np.asarray(losses_test, dtype=float)
-        if len(losses_synth) < 3:
-            return {'correlation': np.nan, 'p_value': np.nan, 'n_samples': len(losses_synth)}
+        Spearman rank correlation for the model evaluation set (Heval).
 
-        corr, p_value = stats.spearmanr(losses_synth, losses_test, alternative=alternative)
-        return {'correlation': corr, 'p_value': p_value, 'n_samples': len(losses_synth)}
+        The real losses must come from the outer evaluation data split, not
+        the calibration holdout. Calibration-only correlation is exposed by
+        ``calibration_spearman_correlation`` and is reported as ``rho_cal``.
+        """
+        losses_synth_eval = np.asarray(losses_synth_eval, dtype=float)
+        losses_real_eval = np.asarray(losses_real_eval, dtype=float)
+        if len(losses_synth_eval) != len(losses_real_eval):
+            raise ValueError("Synthetic and real evaluation losses must have the same length.")
+        if len(losses_synth_eval) < 3:
+            return {'correlation': np.nan, 'p_value': np.nan, 'n_samples': len(losses_synth_eval)}
+
+        corr, p_value = stats.spearmanr(
+            losses_synth_eval, losses_real_eval, alternative=alternative
+        )
+        return {'correlation': corr, 'p_value': p_value, 'n_samples': len(losses_synth_eval)}
+
+    @staticmethod
+    def calibration_spearman_correlation(losses_synth_cal: np.ndarray,
+                                          losses_real_cal: np.ndarray,
+                                          alternative: str = 'two-sided') -> Dict[str, float]:
+        """Spearman correlation for the calibration-only diagnostic ``rho_cal``."""
+        return EvaluationMetrics.spearman_correlation(
+            losses_synth_cal, losses_real_cal, alternative=alternative
+        )
 
     @staticmethod
     def kendall_tau(losses_a: np.ndarray, losses_b: np.ndarray) -> Dict[str, float]:
@@ -409,7 +406,9 @@ class EvaluationMetrics:
         access to Heval: LOO-residual, ESS, w_max, H(w), kappa(Lsyn_cal),
         rho_cal, M, ns, n, task_type.
         """
-        rho_cal = cls.spearman_correlation(synth_losses_cal, real_losses_cal)['correlation']
+        rho_cal = cls.calibration_spearman_correlation(
+            synth_losses_cal, real_losses_cal
+        )['correlation']
         return {
             'loo_residual': loo_residual_value,
             'ess': cls.effective_sample_size(weights),
@@ -478,7 +477,7 @@ class EvaluationMetrics:
         }
 
     # ------------------------------------------------------------------
-    # Visualization (unchanged behavior; internal duplication removed)
+    # Visualization
     # ------------------------------------------------------------------
 
     @staticmethod
