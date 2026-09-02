@@ -547,7 +547,7 @@ class SHAPWeightsAnalyzer:
 
     def full_summary_report(self):
         """
-        Print comprehensive summary for both weights and y_real analyses.
+        Print summary statistics for the configured analysis targets.
         """
         self.summary_report(target="weights")
         

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Tuple
-from scipy.optimize import minimize, Bounds, BFGS, LinearConstraint
+from scipy.optimize import minimize, Bounds
 import cvxpy as cp
 from xgboost import XGBClassifier
 
@@ -232,7 +232,6 @@ class SyntheticDataCalibrator:
             
             if self.verbose:
                 print(f"  Final objective: {self.final_loss:.6f}")
-                print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
                 print(f"  Weight sum: {np.sum(w_opt):.6f}")
                 print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N}")
                 print(f"  Max weight: {np.max(w_opt):.6f}")
@@ -303,7 +302,6 @@ class SyntheticDataCalibrator:
                     
                 if self.verbose:
                     print(f"  Final objective: {self.final_loss:.6f}")
-                    print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N_c}")
                     print(f"  Weight sum: {np.sum(w_opt):.6f}")
                     print(f"  Non-zero weights: {np.sum(w_opt > 1e-6)}/{N_c}")
                     print(f"  Max weight: {np.max(w_opt):.6f}")
@@ -425,7 +423,7 @@ class SyntheticBPRCalibrator:
     samples so that model ranking induced by weighted synthetic losses matches
     the ranking observed on real validation losses.
 
-    KEY DESIGN DECISIONS (aligned with Algorithm 1 in the BPR paper):
+    The optimizer uses the following conventions:
     - Weights live on the probability simplex Δ^Ns (sum=1, w>=0)
     - Optimization uses projected gradient descent with simplex projection
     - Preference weights d_{(a,b)} = r_a - r_b (magnitude-aware)
@@ -606,124 +604,6 @@ class SyntheticBPRCalibrator:
         self.diff_matrix = D
         return D
 
-    
-    def _solve_bpr_optimization(self, L: np.ndarray, r: np.ndarray) -> Tuple[np.ndarray, List[float]]:
-        n_samples, M = L.shape
-        if n_samples <= 0:
-            raise ValueError("Synthetic dataset must contain at least one sample.")
-
-        pref_pairs, d  = self._build_pref_set(r, self.eps)
-        L = self._winsorize_loss_matrix(L, q=0.99)
-        D = self._build_diff_matrix(L, pref_pairs)
-
-        u = 1.0 / n_samples
-        log_u = np.log(u)
-        omega = np.ones_like(d)
-        p = 1.0 / (1.0 + np.exp(d / (np.median(d) * self.tau + 1e-8)))
-
-        C = np.eye(M) - np.ones((M, M)) / M
-        Cr = C @ r
-        Cr_norm_sq = Cr @ Cr
-
-        w0 = np.ones(n_samples) / n_samples
-        #w0 = np.ones(n_samples)
-        margins0 = D @ w0
-        fixed_scale = np.median(np.abs(margins0)) * self.beta + 1e-8
-
-        def update_gamma(w):
-            if Cr_norm_sq <= 1e-15 or self.rho <= 0:
-                return 0.0
-            return max(0.0, float(Cr @ (L.T @ w)) / Cr_norm_sq)
-
-        def gradient(w):
-            margins    = D @ w
-            logits     = np.clip(margins / fixed_scale, -500.0, 500.0)
-            q          = 1.0 / (1.0 + np.exp(-logits))
-            grad_bpr   = (1.0 / fixed_scale) * D.T @ (omega * (q - p))
-            grad_l2    = 2 * self.lambda_reg * w
-            grad_kl    = np.zeros_like(w)
-            if self.mu > 0:
-                w_clip  = np.maximum(w, 1e-15)
-                grad_kl = self.mu * (np.log(w_clip) - log_u + 1)
-            grad_align = np.zeros_like(w)
-            if self.rho > 0:
-                gamma      = update_gamma(w)
-                residual   = C @ (L.T @ w) - gamma * Cr
-                grad_align = 2 * self.rho * (L @ (C @ residual))
-            return grad_bpr + grad_l2 + grad_kl + grad_align
-
-        def objective(w):
-            margins   = D @ w
-            logits    = np.clip(margins / fixed_scale, -500.0, 500.0)
-            sig       = 1.0 / (1.0 + np.exp(-logits))
-            bpr_loss  = -float(omega @ (p * np.log(sig + 1e-15) + (1-p) * np.log(1 - sig + 1e-15)))
-            l2_loss   = self.lambda_reg * float(w @ w)
-            kl_loss   = 0.0
-            if self.mu > 0:
-                w_clip  = np.maximum(w, 1e-15)
-                kl_loss = self.mu * float(np.sum(w * (np.log(w_clip) - log_u)))
-            align_loss = 0.0
-            if self.rho > 0:
-                gamma      = update_gamma(w)
-                residual   = C @ (L.T @ w) - gamma * Cr
-                align_loss = self.rho * float(residual @ residual)
-            return bpr_loss + l2_loss + kl_loss + align_loss
-
-        # ------------------------------------------------------------------ #
-        # Entropic Mirror Descent + AdaGrad (per-coordinate adaptive step)
-        # ------------------------------------------------------------------ #
-        w            = w0.copy()
-        loss_history = [objective(w)]
-        eps_clip     = 1e-12
-
-        # AdaGrad: η_i = eta_base / sqrt(Σ_t g_{t,i}²)
-        # eta_base=1.0 даёт нормированный шаг ~1/|g_i| на первой итерации
-        eta_base   = 1.0
-        delta      = 1e-8          # защита от деления на 0
-        G_sq_accum = np.zeros(n_samples)
-
-        max_iter   = 10_000        # AdaGrad сходится за 1-5k итераций
-        tol        = 1e-7          # практический критерий зеркальной нормы
-        patience   = 300           # число итераций без улучшения
-
-        best_loss  = loss_history[0]
-        no_improve = 0
-
-        for t in range(max_iter):
-            g           = gradient(w)
-            G_sq_accum += g ** 2
-
-            # Покоординатный шаг
-            eta_vec = eta_base / (np.sqrt(G_sq_accum) + delta)
-
-            # Мультипликативное обновление EMD
-            w_new = np.clip(w * np.exp(-eta_vec * g), eps_clip, 1.0)
-            loss_new = objective(w_new)
-            w = w_new
-            loss_history.append(loss_new)
-
-            # Критерий сходимости: KKT зеркальное условие w_i * g_i → 0
-            mirror_norm = np.max(np.abs(w * g))
-            if mirror_norm < tol:
-                print(f"EMD converged at iter {t+1} | loss={loss_new:.6f} | mirror={mirror_norm:.2e}")
-                break
-
-            if loss_new < best_loss - 1e-10:
-                best_loss  = loss_new
-                no_improve = 0
-            else:
-                no_improve += 1
-            if no_improve >= patience:
-                print(f"EMD early stop at iter {t+1} | best_loss={best_loss:.6f}")
-                break
-
-            if t % 500 == 0:
-                print(f"iter={t:5d} | loss={loss_new:.4f} | mirror={mirror_norm:.2e} | eta_mean={eta_vec.mean():.3e}")
-
-        self.optimization_result = {'final_w': w, 'loss_history': loss_history}
-        return w, loss_history
-    '''
-
     def _solve_bpr_optimization(self, L: np.ndarray, r: np.ndarray) -> Tuple[np.ndarray, List[float]]:
         """Solve BPR optimization via CVXPY interior-point method."""
         n_samples, M = L.shape
@@ -803,24 +683,6 @@ class SyntheticBPRCalibrator:
 
         self.optimization_result = {'final_w': w_opt, 'loss_history': loss_history}
         return w_opt, loss_history
-    '''
-    def _compute_bpr_objective(self, w: np.ndarray, D: np.ndarray, d: np.ndarray) -> float:
-        """Compute BPR objective value for current weights (at self.beta)."""
-        n_samples = len(w)
-        u = 1.0 / n_samples
-        log_u = np.log(u)
-
-        margins = D @ w
-        logits = np.clip(self.beta * margins, -500.0, 500.0)
-        sigmoid_vals = 1.0 / (1.0 + np.exp(-logits))
-        bpr_term = -float(d @ np.log(sigmoid_vals + 1e-15))
-        l2_term = self.lambda_reg * float(np.dot(w, w))
-        kl_term = 0.0
-
-        if self.mu > 0:
-            w_clip = np.maximum(w, 1e-15)
-            kl_term = self.mu * float(np.sum(w * (np.log(w_clip) - log_u)))
-        return bpr_term + l2_term + kl_term        
 
     def fit(self,
             calibration_models: List[Any],
@@ -1492,21 +1354,14 @@ class SyntheticKMMCalibration:
         Xs = np.asarray(X_synth, dtype=float)
         Xr_std, Xs_std = self._standardize(Xr, Xs)
 
-        rng = np.random.RandomState(self.random_state)
-
-        Xr_fit = Xr_std if n_real <= self.max_real_ref else Xr_std[
-            rng.choice(n_real, self.max_real_ref, replace=False)
-        ]
-        if n_synth <= self.max_synth_ref:
-            fit_idx = np.arange(n_synth)
-        else:
-            fit_idx = rng.choice(n_synth, self.max_synth_ref, replace=False)
-        Xs_fit = Xs_std[fit_idx]
-
+        # KMM solves for one coefficient per synthetic point.  Solving on a
+        # subset and assigning unit weights to the omitted points changes the
+        # optimization problem and biases the resulting distribution.
+        Xr_fit = Xr_std
+        Xs_fit = Xs_std
         raw_weights = self._solve_kmm_qp(Xs_fit, Xr_fit)
 
-        full_weights = np.ones(n_synth, dtype=np.float64)
-        full_weights[fit_idx] = raw_weights
+        full_weights = np.asarray(raw_weights, dtype=np.float64)
 
         weight_sum = float(np.sum(full_weights))
         if not np.isfinite(weight_sum) or weight_sum <= 0:
@@ -1521,7 +1376,7 @@ class SyntheticKMMCalibration:
             print("\n" + "=" * 70)
             print("CALIBRATING SYNTHETIC SAMPLES (KMM)")
             print("=" * 70)
-            print(f"  kern={self.kern}, B={self.B}, real_used={Xr_fit.shape[0]}, synth_used={len(fit_idx)}")
+            print(f"  kern={self.kern}, B={self.B}, real_used={Xr_fit.shape[0]}, synth_used={len(Xs_fit)}")
             print(f"  Weight sum: {self.weights.sum():.6f}, max weight: {self.weights.max():.6f}")
 
         return self.weights
