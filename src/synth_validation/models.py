@@ -4,20 +4,12 @@ Model Selection Framework.
 Implementation of model architectures and selection framework for both
 classification and regression tasks.
 
-Redesigned per the semester research plan (WP1-WP2): the calibration pool H
-is restricted to exactly three algorithmic families - XGBoost, RandomForest,
-and MLP - so that:
-  (i)  WP1 (external validity) can run clean Random-vs-LOFO
-       (leave-one-family-out) splits with Heval = one full family;
-  (ii) WP2 (Hcal selection) can compare random / stratified-by-family /
-       K-means-on-loss-profile / pivoted-QR / greedy-max-distance strategies
-       on a pool whose internal diversity is fully controlled by explicit,
-       fixed hyperparameter grids (no accidental redundancy from unrelated
-       model families such as semi-supervised learners, discriminant
-       analysis, or stacking meta-models, which were removed).
+The model pool contains linear models, XGBoost, RandomForest, and MLP
+configurations for classification and regression.
 
-Pool size: K = 50 per task type (XGBoost: 20, RandomForest: 15, MLP: 15),
-matching the plan's WP1 notation (Section 3.2, "Pul: K=50").
+Pool size: K = 65 per task type (linear: 15, XGBoost: 20,
+RandomForest: 15, MLP: 15),
+The pool contains 65 configurations per task type.
 """
 
 import itertools
@@ -32,6 +24,14 @@ from sklearn.metrics import (
     mean_absolute_error, r2_score
 )
 from sklearn.dummy import DummyClassifier, DummyRegressor
+from sklearn.linear_model import (
+    ElasticNet,
+    Lasso,
+    LinearRegression,
+    LogisticRegression,
+    Ridge,
+    SGDClassifier,
+)
 
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
@@ -40,7 +40,7 @@ try:
     from xgboost import XGBClassifier, XGBRegressor
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "xgboost is required by the WP1/WP2 model pool (K=50: XGBoost/RF/MLP). "
+        "xgboost is required by the model pool (XGBoost/RF/MLP). "
         "Install it with `pip install xgboost`."
     ) from exc
 
@@ -60,18 +60,20 @@ class ModelSelectionFramework:
     """
     Complete framework for model selection using synthetic data.
 
-    The model pool H = F_xgb ⊔ F_rf ⊔ F_mlp (three families, K=50 total)
+    The model pool H = F_linear ⊔ F_xgb ⊔ F_rf ⊔ F_mlp
+    (four families, K=65 total)
     is the controlled substrate for:
       - WP1 Random vs. LOFO (leave-one-family-out) transfer experiments,
       - WP2 calibration-set (Hcal) selection strategies over loss profiles.
     """
 
     # Fixed pool sizes per family, per the research plan (Section 3.2).
+    N_LINEAR = 15
     N_XGBOOST = 20
     N_RANDOM_FOREST = 15
     N_MLP = 15
 
-    FAMILIES = ("xgboost", "random_forest", "mlp")
+    FAMILIES = ("linear", "xgboost", "random_forest", "mlp")
 
     def __init__(self, task_type: str = 'classification', loss_type: str = None):
         """
@@ -97,15 +99,17 @@ class ModelSelectionFramework:
     # ------------------------------------------------------------------
 
     def get_model_architectures(self) -> List[ModelConfig]:
-        """Get the K=50 model pool (XGBoost 20 + RandomForest 15 + MLP 15)."""
+        """Get the K=65 model pool (linear 15 + XGBoost 20 + RF 15 + MLP 15)."""
         if self.task_type == 'regression':
             return (
-                self._get_xgboost_architectures_regression()
+                self._get_linear_architectures_regression()
+                + self._get_xgboost_architectures_regression()
                 + self._get_random_forest_architectures_regression()
                 + self._get_mlp_architectures_regression()
             )
         return (
-            self._get_xgboost_architectures_classification()
+            self._get_linear_architectures_classification()
+            + self._get_xgboost_architectures_classification()
             + self._get_random_forest_architectures_classification()
             + self._get_mlp_architectures_classification()
         )
@@ -117,6 +121,71 @@ class ModelSelectionFramework:
         return [a for a in self.get_model_architectures() if a.family == family]
 
     # ------------------------------------------------------------------
+    # Linear models
+    # ------------------------------------------------------------------
+
+    def _get_linear_architectures_classification(self) -> List[ModelConfig]:
+        """Return 15 deterministic linear classification configurations."""
+        configs = [
+            ("LogReg_L2_C0p01", LogisticRegression, {"C": 0.01, "penalty": "l2", "solver": "lbfgs"}),
+            ("LogReg_L2_C0p1", LogisticRegression, {"C": 0.1, "penalty": "l2", "solver": "lbfgs"}),
+            ("LogReg_L2_C1", LogisticRegression, {"C": 1.0, "penalty": "l2", "solver": "lbfgs"}),
+            ("LogReg_L2_C10", LogisticRegression, {"C": 10.0, "penalty": "l2", "solver": "lbfgs"}),
+            ("LogReg_L1_C0p1", LogisticRegression, {"C": 0.1, "penalty": "l1", "solver": "liblinear"}),
+            ("LogReg_L1_C1", LogisticRegression, {"C": 1.0, "penalty": "l1", "solver": "liblinear"}),
+            ("LogReg_L1_C10", LogisticRegression, {"C": 10.0, "penalty": "l1", "solver": "liblinear"}),
+            ("LogReg_Elastic_C0p1", LogisticRegression, {"C": 0.1, "penalty": "elasticnet", "solver": "saga", "l1_ratio": 0.25}),
+            ("LogReg_Elastic_C1", LogisticRegression, {"C": 1.0, "penalty": "elasticnet", "solver": "saga", "l1_ratio": 0.5}),
+            ("LogReg_Elastic_C10", LogisticRegression, {"C": 10.0, "penalty": "elasticnet", "solver": "saga", "l1_ratio": 0.75}),
+            ("SGD_LogLoss_Alpha1e-5", SGDClassifier, {"loss": "log_loss", "alpha": 1e-5, "penalty": "l2"}),
+            ("SGD_LogLoss_Alpha1e-4", SGDClassifier, {"loss": "log_loss", "alpha": 1e-4, "penalty": "l2"}),
+            ("SGD_LogLoss_Alpha1e-3", SGDClassifier, {"loss": "log_loss", "alpha": 1e-3, "penalty": "l2"}),
+            ("SGD_LogLoss_L1", SGDClassifier, {"loss": "log_loss", "alpha": 1e-4, "penalty": "l1"}),
+            ("SGD_LogLoss_Elastic", SGDClassifier, {"loss": "log_loss", "alpha": 1e-4, "penalty": "elasticnet", "l1_ratio": 0.5}),
+        ]
+        return [
+            ModelConfig(
+                name=name,
+                model_class=model_class,
+                params={**params, "max_iter": 1000, "random_state": RANDOM_SEED},
+                family="linear",
+            )
+            for name, model_class, params in configs
+        ]
+
+    def _get_linear_architectures_regression(self) -> List[ModelConfig]:
+        """Return 15 deterministic linear regression configurations."""
+        configs = [
+            ("LinearRegression", LinearRegression, {}),
+            ("Ridge_Alpha0p01", Ridge, {"alpha": 0.01}),
+            ("Ridge_Alpha0p1", Ridge, {"alpha": 0.1}),
+            ("Ridge_Alpha1", Ridge, {"alpha": 1.0}),
+            ("Ridge_Alpha10", Ridge, {"alpha": 10.0}),
+            ("Ridge_Alpha100", Ridge, {"alpha": 100.0}),
+            ("Ridge_Alpha1000", Ridge, {"alpha": 1000.0}),
+            ("Lasso_Alpha0p0001", Lasso, {"alpha": 0.0001}),
+            ("Lasso_Alpha0p001", Lasso, {"alpha": 0.001}),
+            ("Lasso_Alpha0p01", Lasso, {"alpha": 0.01}),
+            ("Lasso_Alpha0p1", Lasso, {"alpha": 0.1}),
+            ("ElasticNet_Alpha0p001", ElasticNet, {"alpha": 0.001, "l1_ratio": 0.25}),
+            ("ElasticNet_Alpha0p01", ElasticNet, {"alpha": 0.01, "l1_ratio": 0.5}),
+            ("ElasticNet_Alpha0p1", ElasticNet, {"alpha": 0.1, "l1_ratio": 0.75}),
+            ("ElasticNet_Alpha1", ElasticNet, {"alpha": 1.0, "l1_ratio": 0.9}),
+        ]
+        return [
+            ModelConfig(
+                name=name,
+                model_class=model_class,
+                params={**params, "max_iter": 2000, "random_state": RANDOM_SEED}
+                if model_class is not LinearRegression
+                else params,
+                family="linear",
+            )
+            for name, model_class, params in configs
+        ]
+
+    # ---------------------- XGBoost ----------------------
+
     # Grid builders - each yields exactly N configs via a deterministic,
     # evenly-spaced subsample of the full Cartesian grid (so diversity in
     # loss-space is preserved without combinatorial blow-up).
@@ -283,7 +352,7 @@ class ModelSelectionFramework:
         return archs
 
     # ------------------------------------------------------------------
-    # Training / evaluation (unchanged contract vs. previous version)
+    # Training and evaluation
     # ------------------------------------------------------------------
 
     def train_model(self, config: ModelConfig, X_train: pd.DataFrame,
