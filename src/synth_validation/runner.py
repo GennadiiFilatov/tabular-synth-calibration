@@ -210,7 +210,7 @@ class ExperimentRunner:
             if method in registry:
                 continue
 
-            if method == "constrained":
+            if method == "alignment":
                 # Reuse the already-constructed constrained-QP calibrator so we
                 # don't silently create a second, differently-configured copy.
                 registry[method] = self.calibrator
@@ -1461,11 +1461,9 @@ class ExperimentRunner:
                 for start_pos in range(n_unique):
                     targets = unique_sorted_losses[start_pos] + step * np.arange(M)
 
-                    # Быстрая проверка: последний target не выходит за пул
                     if targets[-1] > unique_sorted_losses[-1] + 1e-9:
                         break
 
-                    # Snap каждого target к ближайшей ещё не выбранной уникальной модели
                     chosen_pos = []
                     used = set()
                     valid = True
