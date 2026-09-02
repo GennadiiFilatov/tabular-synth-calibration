@@ -198,7 +198,7 @@ class ExperimentRunner:
             self._calibrator_registry = {}
         registry = self._calibrator_registry
 
-        supported = {"constrained", "bpr", "density", "kmm"}
+        supported = {"alignment", "constrained", "bpr", "density", "kmm"}
         unknown = set(calibration_methods) - supported
         if unknown:
             raise ValueError(
@@ -277,7 +277,7 @@ class ExperimentRunner:
         same X_synth/y_synth, same X_real_val/y_real_val) so that all methods
         use the same model and data inputs within a fold.
         """
-        if method in ("constrained", "bpr"):
+        if method in ("alignment", "constrained", "bpr"):
             calibrator.fit(
                 calibration_models=calibration_models,
                 X_synth=X_synth,

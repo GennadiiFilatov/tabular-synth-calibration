@@ -23,9 +23,8 @@ Usage:
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
 
 from .utils import RANDOM_SEED
 
@@ -786,14 +785,16 @@ class DataLoader:
 
         # Encode target only for classification
         if task_type == 'classification':
-            if y_train.dtype == 'object' or y_train.dtype.name == 'category':
-                le = LabelEncoder()
-                y_train = pd.Series(le.fit_transform(y_train.astype(str)), index=y_train.index)
-                y_test = pd.Series(le.transform(y_test.astype(str)), index=y_test.index)
-                transformers['target_encoder'] = le
-            else:
-                y_train = y_train.astype(int)
-                y_test = y_test.astype(int)
+            le = LabelEncoder()
+            y_train_values = y_train.astype(str) if (
+                y_train.dtype == 'object' or y_train.dtype.name == 'category'
+            ) else y_train
+            y_test_values = y_test.astype(str) if (
+                y_test.dtype == 'object' or y_test.dtype.name == 'category'
+            ) else y_test
+            y_train = pd.Series(le.fit_transform(y_train_values), index=y_train.index)
+            y_test = pd.Series(le.transform(y_test_values), index=y_test.index)
+            transformers['target_encoder'] = le
         else:
             # For regression, ensure target is numeric and scale it
             y_train = y_train.astype(float)
