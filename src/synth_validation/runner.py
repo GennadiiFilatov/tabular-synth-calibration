@@ -36,7 +36,7 @@ from .calibrator import (
 )
 from .shap_analizer import SHAPWeightsAnalyzer
 from sklearn.base import clone
-from xgboost import XGBClassifier
+from xgboost import XGBClassifier, XGBRegressor
 
 
 class ExperimentRunner:
@@ -1303,18 +1303,33 @@ class ExperimentRunner:
             X_eval_arr = X_eval.values if hasattr(X_eval, "values") else np.asarray(X_eval)
 
             if base_estimator is None:
-                base_estimator = XGBClassifier(
-                    n_estimators=300, max_depth=5, learning_rate=0.1,
-                    tree_method="hist", n_jobs=-1, verbosity=0
-                )
+                if task_type == "classification":
+                    base_estimator = XGBClassifier(
+                        n_estimators=300, max_depth=5, learning_rate=0.1,
+                        tree_method="hist", n_jobs=-1, verbosity=0
+                    )
+                else:  # regression
+                    base_estimator = XGBRegressor(
+                        n_estimators=300, max_depth=5, learning_rate=0.1,
+                        tree_method="hist", n_jobs=-1, verbosity=0
+                    )
 
-            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            # Use StratifiedKFold for classification, KFold for regression
+            if task_type == "classification":
+                splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            else:  # regression
+                splitter = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+            
             fold_preds = []
 
             for train_idx, _ in splitter.split(X_arr, y_arr):
                 model = clone(base_estimator)
                 model.fit(X_arr[train_idx], y_arr[train_idx])
-                pred = model.predict_proba(X_eval_arr)[:, 1]
+                # For classification, use predict_proba; for regression, use predict
+                if task_type == "classification":
+                    pred = model.predict_proba(X_eval_arr)[:, 1]
+                else:  # regression
+                    pred = model.predict(X_eval_arr)
                 fold_preds.append(pred)
 
             return np.mean(np.stack(fold_preds, axis=0), axis=0)

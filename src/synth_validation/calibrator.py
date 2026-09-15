@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional, Tuple
 from scipy.optimize import minimize, Bounds
 import cvxpy as cp
+from cvxopt import matrix, solvers
 from xgboost import XGBClassifier
 
 MAX_LOG_LOSS = 5.0
@@ -1246,11 +1247,11 @@ class SyntheticKMMCalibration:
         n = len(data)
         if n < 2:
             return 1.0
+        # Compute pairwise squared distances
         pairwise_dists = np.sum((data[:, None] - data[None, :]) ** 2, axis=-1)
-        nonzero = pairwise_dists[pairwise_dists > 0]
-        median_dist = np.median(nonzero) if nonzero.size > 0 else 1.0
-        denom = np.log(max(n, 2))
-        return float(median_dist / denom) if denom > 0 else float(median_dist)
+        median_dist = float(np.median(pairwise_dists))
+        # Scale by log(n) as in original
+        return median_dist / np.log(max(n, 2))
 
     # ------------------------------------------------------------------
     def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
@@ -1297,14 +1298,26 @@ class SyntheticKMMCalibration:
 
     # ------------------------------------------------------------------
     def _solve_kmm_qp(self, Z_synth: np.ndarray, Z_real: np.ndarray) -> np.ndarray:
-        """Solve the KMM QP with cvxpy, consistent with the solver library
-        already used elsewhere in this file (SyntheticDataCalibrator /
-        SyntheticBPRCalibrator use cvxpy/scipy.optimize, not cvxopt)."""
+        """Solve the KMM QP using cvxopt, matching the original implementation.
+        
+        Solves:
+            min_w  0.5 * w^T K w - kappa^T w
+            s.t.   0 <= w_i <= B
+                   |sum(w_i) - n_synth| <= n_synth * eps
+        
+        where:
+            K = Kernel matrix over synthetic samples
+            kappa = Kernel cross-product between synthetic and real samples
+        
+        Reference: https://github.com/awesomeslayer/Importance-reweighting/blob/master/source/estimations.py
+        """
         n_synth = Z_synth.shape[0]
         n_real = Z_real.shape[0]
 
+        # Auto-compute eps if not provided
         eps = self.eps if self.eps is not None else max(1e-6, self.B / np.sqrt(n_synth))
 
+        # Compute kernel matrix and cross-products
         if self.kern == "lin":
             K = Z_synth @ Z_synth.T
             kappa = np.sum((Z_synth @ Z_real.T) * float(n_synth) / float(n_real), axis=1)
@@ -1315,30 +1328,48 @@ class SyntheticKMMCalibration:
         else:
             raise ValueError(f"Unknown kernel '{self.kern}'. Expected 'lin' or 'rbf'.")
 
-        K = K + 1e-8 * np.eye(n_synth)  # numerical jitter for PSD stability
+        # Convert to cvxopt matrix format (original uses cvxopt, not cvxpy)
+        K = matrix(K, tc='d')
+        kappa = matrix(kappa, tc='d')
 
-        w = cp.Variable(n_synth)
-        objective = cp.Minimize(0.5 * cp.quad_form(w, cp.psd_wrap(K)) - kappa @ w)
-        constraints = [
-            w >= 0,
-            w <= self.B,
-            cp.sum(w) <= n_synth * (1 + eps),
-            cp.sum(w) >= n_synth * (1 - eps),
-        ]
-        problem = cp.Problem(objective, constraints)
+        # Build constraint matrices for cvxopt QP solver
+        # Constraints:
+        #   1. sum(w) <= n_synth * (1 + eps)  =>  ones^T w <= n_synth(1+eps)
+        #   2. sum(w) >= n_synth * (1 - eps)  =>  -ones^T w <= -n_synth(1-eps)
+        #   3. w <= B  =>  w_i <= B
+        #   4. w >= 0  =>  -w_i <= 0
+        # In cvxopt, we write: G w <= h
+        
+        G = matrix(
+            np.vstack([
+                np.ones((1, n_synth)),      # sum(w) <= n_synth(1+eps)
+                -np.ones((1, n_synth)),     # -sum(w) <= -n_synth(1-eps)
+                np.eye(n_synth),            # w <= B
+                -np.eye(n_synth)            # -w <= 0 (i.e., w >= 0)
+            ]),
+            tc='d'
+        )
+        h = matrix(
+            np.hstack([
+                n_synth * (1 + eps),        # sum(w) <= n_synth(1+eps)
+                n_synth * (eps - 1),        # sum(w) >= n_synth(1-eps)
+                self.B * np.ones(n_synth),  # w_i <= B
+                np.zeros(n_synth)           # w_i >= 0
+            ]),
+            tc='d'
+        )
+
+        # Solve the QP: min_w 0.5 w^T K w - kappa^T w
         try:
-            problem.solve(solver=cp.OSQP)
-            if w.value is None or problem.status not in ("optimal", "optimal_inaccurate"):
-                if self.verbose:
-                    print(f"  KMM QP status={problem.status}; falling back to uniform weights.")
-                return np.ones(n_synth)
-            coef = np.asarray(w.value).flatten()
+            sol = solvers.qp(K, -kappa, G, h, verbose=False)
+            coef = np.array(sol['x']).flatten()
+            # Clip to ensure feasibility
+            coef = np.clip(coef, 0, self.B)
+            return coef
         except Exception as exc:
             if self.verbose:
-                print(f"  KMM QP raised {exc!r}; falling back to uniform weights.")
+                print(f"  KMM QP solver failed with {exc!r}; falling back to uniform weights.")
             return np.ones(n_synth)
-
-        return np.clip(coef, 0, self.B)
 
     # ------------------------------------------------------------------
     def fit(self, X_real: pd.DataFrame, X_synth: pd.DataFrame) -> np.ndarray:
