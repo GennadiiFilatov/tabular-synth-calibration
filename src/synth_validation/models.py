@@ -64,6 +64,8 @@ class ModelSelectionFramework:
     (four families, K=65 total)
     is the controlled substrate for:
       - WP1 Random vs. LOFO (leave-one-family-out) transfer experiments,
+        implemented in `family_composition.run_family_composition_experiment`
+        and `family_composition.run_mcal_sweep_experiment`,
       - WP2 calibration-set (Hcal) selection strategies over loss profiles.
     """
 
