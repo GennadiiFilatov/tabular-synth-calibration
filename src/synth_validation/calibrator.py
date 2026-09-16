@@ -476,7 +476,7 @@ class SyntheticBPRCalibrator:
         return np.asarray(y).reshape(-1)
     
     def _winsorize_loss_matrix(self, L: np.ndarray, q: float = 0.99) -> np.ndarray:
-        upper = np.quantile(L, q, axis=0)   # по каждой модели отдельно
+        upper = np.quantile(L, q, axis=0)
         return np.clip(L, 0.0, upper[np.newaxis, :])
 
     def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
@@ -632,10 +632,7 @@ class SyntheticBPRCalibrator:
         w = cp.Variable(n_samples, nonneg=True)   # w ∈ [0, 1]
 
         # ---- BPR loss ----
-        # -Σ ωᵢ [pᵢ log σ(zᵢ) + (1-pᵢ) log(1-σ(zᵢ))]
-        # = Σ ωᵢ [pᵢ · softplus(-zᵢ) + (1-pᵢ) · softplus(zᵢ)]
-        # cp.logistic(x) ≡ log(1 + exp(x))  [= softplus]
-        logits   = (1.0 / fixed_scale) * (D @ w)        # аффинное выражение
+        logits = (1.0 / fixed_scale) * (D @ w)
         bpr_loss = cp.sum(
             cp.multiply(omega,
                 cp.multiply(p,       cp.logistic(-logits)) +
@@ -646,8 +643,7 @@ class SyntheticBPRCalibrator:
         # ---- L2 loss ----
         l2_loss = self.lambda_reg * cp.sum_squares(w)
 
-        # ---- KL loss  KL(w ‖ u) = Σ wᵢ(log wᵢ − log u) ----
-        # cp.entr(w) = −w log w  =>  −cp.sum(cp.entr(w)) = Σ wᵢ log wᵢ
+        # ---- KL loss ----
         kl_loss = 0
         if self.mu > 0:
             kl_loss = self.mu * (-cp.sum(cp.entr(w)) - log_u * cp.sum(w))
@@ -655,9 +651,9 @@ class SyntheticBPRCalibrator:
         # ---- Alignment loss ----
         align_loss = 0
         if self.rho > 0 and Cr_norm_sq > 1e-15:
-            gamma      = cp.Variable(nonneg=True)          # γ ≥ 0, совместная переменная
-            CL         = C @ L.T                           # (M × n_samples), константа
-            residual   = CL @ w - gamma * Cr
+            gamma = cp.Variable(nonneg=True)
+            CL = C @ L.T
+            residual = CL @ w - gamma * Cr
             align_loss = self.rho * cp.sum_squares(residual)
 
 
@@ -667,7 +663,7 @@ class SyntheticBPRCalibrator:
         prob = cp.Problem(cp.Minimize(total_loss), constraints)
         prob.solve(
             solver=cp.SCS,
-            eps=1e-6,           # точность допустима для ранжирования
+            eps=1e-6,
             max_iters=50000,
             acceleration_lookback=10,
             verbose=False,
@@ -679,8 +675,8 @@ class SyntheticBPRCalibrator:
                 "Try solver=cp.SCS or increase max_iter."
             )
 
-        w_opt        = w.value
-        loss_history = [float(prob.value)]   # одно значение — нет итераций как в callback
+        w_opt = w.value
+        loss_history = [float(prob.value)]
 
         self.optimization_result = {'final_w': w_opt, 'loss_history': loss_history}
         return w_opt, loss_history
@@ -1180,10 +1176,6 @@ class PPICalibration:
 class SyntheticKMMCalibration:
     """Calibrate synthetic samples using Kernel Mean Matching (KMM).
 
-    Ported from https://github.com/awesomeslayer/Importance-reweighting
-    (source/estimations.py: kernel_mean_matching / compute_rbf / adjust_sigma).
-    Solves the moment-matching QP
-
         min_w  0.5 * w^T K w - kappa^T w
         s.t.   0 <= w_i <= B,  |sum(w_i) - n_synth| <= n_synth * eps
 
@@ -1224,7 +1216,6 @@ class SyntheticKMMCalibration:
         self._mu = None
         self._sigma_scale = None
 
-    # ------------------------------------------------------------------
     def _to_numpy_1d(self, y: Any) -> np.ndarray:
         return y.values if hasattr(y, "values") else np.array(y)
 
@@ -1253,7 +1244,6 @@ class SyntheticKMMCalibration:
         # Scale by log(n) as in original
         return median_dist / np.log(max(n, 2))
 
-    # ------------------------------------------------------------------
     def _compute_sample_losses(self, model: Any, X: pd.DataFrame, y: pd.Series) -> np.ndarray:
         n_samples = len(X)
         y_arr = self._to_numpy_1d(y)
@@ -1296,7 +1286,6 @@ class SyntheticKMMCalibration:
 
         raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-    # ------------------------------------------------------------------
     def _solve_kmm_qp(self, Z_synth: np.ndarray, Z_real: np.ndarray) -> np.ndarray:
         """Solve the KMM QP using cvxopt, matching the original implementation.
         
@@ -1308,8 +1297,6 @@ class SyntheticKMMCalibration:
         where:
             K = Kernel matrix over synthetic samples
             kappa = Kernel cross-product between synthetic and real samples
-        
-        Reference: https://github.com/awesomeslayer/Importance-reweighting/blob/master/source/estimations.py
         """
         n_synth = Z_synth.shape[0]
         n_real = Z_real.shape[0]
@@ -1371,7 +1358,6 @@ class SyntheticKMMCalibration:
                 print(f"  KMM QP solver failed with {exc!r}; falling back to uniform weights.")
             return np.ones(n_synth)
 
-    # ------------------------------------------------------------------
     def fit(self, X_real: pd.DataFrame, X_synth: pd.DataFrame) -> np.ndarray:
         n_real = len(X_real)
         n_synth = len(X_synth)
@@ -1385,9 +1371,6 @@ class SyntheticKMMCalibration:
         Xs = np.asarray(X_synth, dtype=float)
         Xr_std, Xs_std = self._standardize(Xr, Xs)
 
-        # KMM solves for one coefficient per synthetic point.  Solving on a
-        # subset and assigning unit weights to the omitted points changes the
-        # optimization problem and biases the resulting distribution.
         Xr_fit = Xr_std
         Xs_fit = Xs_std
         raw_weights = self._solve_kmm_qp(Xs_fit, Xr_fit)

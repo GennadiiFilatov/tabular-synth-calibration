@@ -1458,11 +1458,9 @@ class ExperimentRunner:
             best_selected = list(unique_sorted_indices)
 
         else:
-            # Перебираем шаги от минимального до максимального возможного
             min_possible_gap = np.diff(unique_sorted_losses).min()
             max_possible_gap = (unique_sorted_losses[-1] - unique_sorted_losses[0]) / (M - 1)
 
-            # Если пул слишком кластеризован — предупредить
             if self.verbose and max_possible_gap < 10 * min_possible_gap:
                 print(f"  WARNING: loss pool is highly clustered "
                     f"(range={unique_sorted_losses[-1]-unique_sorted_losses[0]:.4f}, "
@@ -1510,12 +1508,12 @@ class ExperimentRunner:
                         best_std = std
                         best_selected = [unique_sorted_indices[p] for p in chosen_pos]
 
-            # Fallback: взять равномерно по уникальным позициям (rank-based)
+            # Fallback: rank-based selection
             if best_selected is None:
                 positions = np.round(
                     np.linspace(0, n_unique - 1, M)
                 ).astype(int)
-                positions = list(dict.fromkeys(positions))  # дедупликация позиций
+                positions = list(dict.fromkeys(positions))
                 best_selected = [unique_sorted_indices[p] for p in positions]
 
                 if self.verbose:

@@ -14,6 +14,7 @@ from .confidence import ConfidenceIntervalEstimator
 from .runner import ExperimentRunner
 from .calibrator import SyntheticDataCalibrator
 from .shap_analizer import SHAPWeightsAnalyzer
+from .family_composition import run_family_composition_experiment, run_mcal_sweep_experiment
 
 # Try importing optional modules
 try:
@@ -33,6 +34,8 @@ __all__ = [
     'EvaluationMetrics',
     'ConfidenceIntervalEstimator',
     'TheoreticalFramework',
+    'run_family_composition_experiment',
+    'run_mcal_sweep_experiment',
     
     # Utilities
     'RANDOM_SEED',
